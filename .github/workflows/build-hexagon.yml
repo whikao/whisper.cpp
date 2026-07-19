@@ -31,7 +31,7 @@ jobs:
           unzip -q android-ndk-r28-linux.zip
           echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
 
-            - name: 下载并解压 Hexagon SDK v6.6.0.0
+      - name: 下载并解压 Hexagon SDK v6.6.0.0
         run: |
           cd /tmp
           wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
