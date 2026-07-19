@@ -20,6 +20,9 @@ jobs:
     env:
       ANDROID_ABI: arm64-v8a
       ANDROID_API: 28
+      # 关键：设置环境变量让 hexagon_fun.cmake 能自动检测
+      HEXAGON_SDK_ROOT: ${{ github.workspace }}/hexagon-sdk/6.6.0.0
+      HEXAGON_TOOLS_ROOT: ${{ github.workspace }}/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07
 
     steps:
       - name: Install deps
@@ -44,24 +47,27 @@ jobs:
           
           echo "=== SDK structure ==="
           ls -la hexagon-sdk/
-          find hexagon-sdk -maxdepth 3 -type d | sort | head -30
           
-          # 检查是否有版本号目录
+          # 确保目录结构正确
           if [ -d "hexagon-sdk/6.6.0.0" ]; then
-            echo "Found version directory"
-            HEXAGON_SDK_ROOT="$PWD/hexagon-sdk/6.6.0.0"
+            echo "SDK at hexagon-sdk/6.6.0.0"
           else
-            HEXAGON_SDK_ROOT="$PWD/hexagon-sdk"
+            echo "Reorganizing SDK structure..."
+            mv hexagon-sdk hexagon-sdk-tmp
+            mkdir -p hexagon-sdk/6.6.0.0
+            mv hexagon-sdk-tmp/* hexagon-sdk/6.6.0.0/ 2>/dev/null || true
+            rm -rf hexagon-sdk-tmp
           fi
           
-          echo "HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT" >> $GITHUB_ENV
-          echo "HEXAGON_SDK_PATH=$HEXAGON_SDK_ROOT" >> $GITHUB_ENV
-          echo "HEXAGON_TOOLS_ROOT=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
-          echo "HEXAGON_TOOLS_PATH=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+          echo "=== Final SDK structure ==="
+          ls -la hexagon-sdk/6.6.0.0/
+          find hexagon-sdk/6.6.0.0 -maxdepth 3 -type d | sort | head -30
+          
+          echo "=== Checking hexagon_sdk.json ==="
+          cat hexagon-sdk/6.6.0.0/hexagon_sdk.json 2>/dev/null || echo "No hexagon_sdk.json"
           
           echo "=== Checking tools ==="
-          ls -la "$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/"
-          find "$HEXAGON_SDK_ROOT" -name "hexagon-clang" | head -3
+          ls -la hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/ 2>/dev/null || echo "No HEXAGON_Tools"
 
       - name: Checkout whisper.cpp
         uses: actions/checkout@v4
@@ -74,7 +80,7 @@ jobs:
       - name: Apply patches
         working-directory: whisper.cpp
         run: |
-          # 用 sed 直接修改，不用 patch（单行处理，避免YAML换行问题）
+          # 用 sed 直接修改，单行处理避免YAML问题
           if [ -f ggml/src/ggml-hexagon/htp/hex-dma.c ]; then
             sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory"); memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c 2>/dev/null || true
           fi
@@ -88,6 +94,13 @@ jobs:
       - name: Configure CMake
         working-directory: whisper.cpp
         run: |
+          # 设置环境变量让 hexagon_fun.cmake 自动检测
+          export HEXAGON_SDK_ROOT="${{ github.workspace }}/hexagon-sdk/6.6.0.0"
+          export HEXAGON_TOOLS_ROOT="${{ github.workspace }}/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07"
+          
+          echo "HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT"
+          echo "HEXAGON_TOOLS_ROOT=$HEXAGON_TOOLS_ROOT"
+          
           cmake -B build \
             -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
@@ -96,11 +109,6 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_HEXAGON=ON \
-            -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
-            -DHEXAGON_SDK_PATH="$HEXAGON_SDK_ROOT" \
-            -DHEXAGON_TOOLS_ROOT="$HEXAGON_TOOLS_ROOT" \
-            -DHEXAGON_TOOLS_PATH="$HEXAGON_TOOLS_ROOT" \
-            -DHTP_ARCH_VERSION=v81 \
             -DGGML_OPENMP=OFF \
             -DWHISPER_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_TESTS=ON
