@@ -43,15 +43,25 @@ jobs:
 
       - name: Setup Hexagon SDK
         run: |
-          # Hexagon SDK 需要 Qualcomm 开发者账号下载
-          # 推荐：先本地下载，上传到你 fork 的 GitHub Release，然后 wget 下载
-          # 备用：使用 snapdragon-toolchain 公开镜像（可能不完整）
-          git clone --depth 1 https://github.com/snapdragon-toolchain/hexagon-sdk.git hexagon-sdk-repo 2>/dev/null || true
+          SDK_URL="https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-6.6.0.0.tar.gz"
+          echo "Downloading from $SDK_URL"
+          wget -q --show-progress "$SDK_URL" -O hexagon-sdk.tar.gz
+          
           mkdir -p hexagon-sdk
-          if [ -d "hexagon-sdk-repo" ]; then
-            cp -r hexagon-sdk-repo/* hexagon-sdk/ 2>/dev/null || true
+          tar -xzf hexagon-sdk.tar.gz -C hexagon-sdk/
+          
+          # 检查关键文件
+          if [ ! -f hexagon-sdk/hexagon_sdk.json ]; then
+            echo "Trying alternate path..."
+            mv hexagon-sdk hexagon-sdk-tmp
+            mkdir hexagon-sdk
+            mv hexagon-sdk-tmp/*/* hexagon-sdk/ 2>/dev/null || mv hexagon-sdk-tmp/* hexagon-sdk/
+            rm -rf hexagon-sdk-tmp
           fi
+          
           echo "HEXAGON_SDK_ROOT=$PWD/hexagon-sdk" >> $GITHUB_ENV
+          ls hexagon-sdk/
+
 
       - name: Checkout whisper.cpp
         uses: actions/checkout@v4
