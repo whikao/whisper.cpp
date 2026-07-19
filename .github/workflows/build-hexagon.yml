@@ -31,21 +31,26 @@ jobs:
           unzip -q android-ndk-r28-linux.zip
           echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
 
-      - name: 下载并解压 Hexagon SDK v6.6.0.0
+            - name: 下载并解压 Hexagon SDK v6.6.0.0
         run: |
           cd /tmp
           wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
           tar -xf hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
-          # 检查目录结构
+          
+          echo "=== 检查解压后的目录结构 ==="
           ls -la /tmp/hexagon-sdk/
-          find /tmp/hexagon-sdk -name "hexagon_fun.cmake" -type f
-          # 设置环境变量
-          if [ -d "/tmp/hexagon-sdk/6.6.0.0" ]; then
-            echo "HEXAGON_SDK_ROOT=/tmp/hexagon-sdk/6.6.0.0" >> $GITHUB_ENV
-            echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+          
+          # 用 hexagon_sdk.json 定位 SDK 根目录（不管目录结构怎样）
+          JSON_FILE=$(find /tmp/hexagon-sdk -name "hexagon_sdk.json" -type f | head -1)
+          if [ -n "$JSON_FILE" ]; then
+            SDK_DIR=$(dirname "$JSON_FILE")
+            echo "Found SDK at: $SDK_DIR"
+            echo "HEXAGON_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
+            echo "HEXAGON_TOOLS_ROOT=$SDK_DIR/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
           else
-            echo "HEXAGON_SDK_ROOT=/tmp/hexagon-sdk" >> $GITHUB_ENV
-            echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+            echo "ERROR: hexagon_sdk.json not found!"
+            find /tmp/hexagon-sdk -type f | head -20
+            exit 1
           fi
 
       - name: 修复官方 SDK 的 CMake 兼容性问题
