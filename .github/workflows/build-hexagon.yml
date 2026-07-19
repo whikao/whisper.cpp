@@ -1,15 +1,11 @@
-name: Build Whisper.cpp Android Hexagon (SM8850/V81)
+name: Build Whisper.cpp Android Hexagon v81
 
 on:
   workflow_dispatch:
     inputs:
       whisper_branch:
-        description: 'whisper.cpp branch/tag'
+        description: 'whisper.cpp branch'
         default: 'master'
-        required: true
-      hexagon_sdk_version:
-        description: 'Hexagon SDK version'
-        default: '6.6.0.0'
         required: true
       ndk_version:
         description: 'Android NDK version'
@@ -17,51 +13,62 @@ on:
         required: true
 
 jobs:
-  build-android-hexagon:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
+    
     env:
-      HEXAGON_SDK_VERSION: ${{ github.event.inputs.hexagon_sdk_version }}
-      NDK_VERSION: ${{ github.event.inputs.ndk_version }}
       ANDROID_ABI: arm64-v8a
       ANDROID_API: 28
-      HEXAGON_ARCH: v81
 
     steps:
-      - name: Install dependencies
+      - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build python3 wget curl git build-essential
+          sudo apt-get install -y cmake ninja-build git wget unzip zip
 
       - name: Setup Android NDK
         run: |
-          wget -q "https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip" -O ndk.zip
+          wget -q "https://dl.google.com/android/repository/android-ndk-${{ github.event.inputs.ndk_version }}-linux.zip" -O ndk.zip
           unzip -q ndk.zip && mv android-ndk-* android-ndk
           echo "ANDROID_NDK=$PWD/android-ndk" >> $GITHUB_ENV
-          echo "ANDROID_NDK_ROOT=$PWD/android-ndk" >> $GITHUB_ENV
 
       - name: Setup Hexagon SDK
         run: |
           SDK_URL="https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz"
           echo "Downloading from $SDK_URL"
-          wget -q --show-progress "$SDK_URL" -O hexagon-sdk.tar.gz
+          wget -q --show-progress "$SDK_URL" -O hexagon-sdk.tar.xz
           
           mkdir -p hexagon-sdk
-          tar -xJf hexagon-sdk.tar.gz -C hexagon-sdk/
+          tar -xJf hexagon-sdk.tar.xz -C hexagon-sdk/
           
-          # 检查关键文件
-          if [ ! -f hexagon-sdk/hexagon_sdk.json ]; then
-            echo "Trying alternate path..."
+          echo "=== SDK structure ==="
+          ls -la hexagon-sdk/
+          find hexagon-sdk -maxdepth 3 -type d | sort | head -30
+          
+          # 检查是否有嵌套目录
+          if [ -d "hexagon-sdk/Hexagon_SDK" ]; then
+            echo "Found nested Hexagon_SDK directory"
             mv hexagon-sdk hexagon-sdk-tmp
             mkdir hexagon-sdk
-            mv hexagon-sdk-tmp/*/* hexagon-sdk/ 2>/dev/null || mv hexagon-sdk-tmp/* hexagon-sdk/
+            mv hexagon-sdk-tmp/Hexagon_SDK/* hexagon-sdk/ 2>/dev/null || true
             rm -rf hexagon-sdk-tmp
           fi
           
-          echo "HEXAGON_SDK_ROOT=$PWD/hexagon-sdk" >> $GITHUB_ENV
-          ls hexagon-sdk/
-
+          # 检查是否有版本号目录
+          if [ -d "hexagon-sdk/6.6.0.0" ]; then
+            echo "Found version directory"
+            HEXAGON_SDK_ROOT="$PWD/hexagon-sdk/6.6.0.0"
+          else
+            HEXAGON_SDK_ROOT="$PWD/hexagon-sdk"
+          fi
+          
+          echo "HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT" >> $GITHUB_ENV
+          echo "HEXAGON_TOOLS_ROOT=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+          
+          echo "=== Checking tools ==="
+          ls -la "$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/" 2>/dev/null || echo "No HEXAGON_Tools found"
+          find "$HEXAGON_SDK_ROOT" -name "hexagon-clang" 2>/dev/null || echo "No hexagon-clang"
 
       - name: Checkout whisper.cpp
         uses: actions/checkout@v4
@@ -71,89 +78,24 @@ jobs:
           submodules: recursive
           path: whisper.cpp
 
-      # ============================================================
-      # 核心：应用补丁修复乱码问题
-      # ============================================================
-      - name: Apply critical patches
+      - name: Apply patches
         working-directory: whisper.cpp
         run: |
-          mkdir -p patches
-
-          # ---- 补丁1: hex-dma.c 缓存同步 ----
-          cat > patches/01-hex-dma-cache.patch << 'EOF'
-          --- a/ggml/src/ggml-hexagon/htp/hex-dma.c
-          +++ b/ggml/src/ggml-hexagon/htp/hex-dma.c
-          @@ -45,10 +45,18 @@ int hexagon_dma_copy(void *dst, const void *src, size_t size, int direction) {
-               if (!dst || !src || size == 0) return -1;
-               
-               if (direction == HEXAGON_DMA_H2D) {
-          +        #ifdef __aarch64__
-          +        __builtin___clear_cache((char*)src, (char*)src + size);
-          +        #endif
-                   memcpy(dst, src, size);
-          +        asm volatile("dmb ishst" ::: "memory");
-               } else {
-          +        asm volatile("dmb ishld" ::: "memory");
-                   memcpy(dst, src, size);
-          +        #ifdef __aarch64__
-          +        __builtin___clear_cache((char*)dst, (char*)dst + size);
-          +        #endif
-               }
-               return 0;
-           }
-          EOF
-
-          # ---- 补丁2: ION 64KB对齐 + 缓存标志 ----
-          cat > patches/02-ion-alloc.patch << 'EOF'
-          --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-          +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-          @@ -195,12 +195,16 @@ static void * ggmlhexagon_allocate_ion_buffer(size_t size) {
-               int ion_fd = open("/dev/ion", O_RDONLY);
-               if (ion_fd < 0) return NULL;
-               
-          -    size_t aligned_size = (size + 4095) & ~4095;
-          +    // v81 requires 64KB alignment
-          +    size_t aligned_size = (size + 65535) & ~65535;
-               
-               struct ion_allocation_data alloc_data = {
-                   .len = aligned_size,
-                   .align = 0,
-                   .heap_id_mask = ION_HEAP_SYSTEM_MASK,
-          -        .flags = ION_FLAG_CACHED,
-          +        // Use NEEDS_SYNC to avoid coherence issues on v81
-          +        .flags = ION_FLAG_CACHED_NEEDS_SYNC,
-               };
-               
-               int ret = ioctl(ion_fd, ION_IOC_ALLOC, &alloc_data);
-          EOF
-
-          # ---- 补丁3: v81 架构检测 fallback ----
-          cat > patches/03-v81-detect.patch << 'EOF'
-          --- a/ggml/src/ggml-hexagon/htp-drv.cpp
-          +++ b/ggml/src/ggml-hexagon/htp-drv.cpp
-          @@ -118,7 +118,9 @@ static int ggmlhexagon_get_arch_version() {
-               const char *force_arch = getenv("GGML_HEXAGON_ARCH");
-               if (force_arch) return atoi(force_arch);
-               
-          -    int version = ggmlhexagon_query_htp_version();
-          +    int version = 81; // Force v81 for SM8850
-          +    // Or keep detection but fix fallback:
-          +    // int version = ggmlhexagon_query_htp_version();
-               if (version < 0) {
-                   GGML_LOG_WARN("ggml-hex: failed to query HTP version, defaulting to v81\n");
-                   return 81;
-          EOF
-
-          # 尝试应用补丁（失败则提示手动修改）
-          for p in patches/*.patch; do
-            echo "Applying $p ..."
-            patch -p1 --dry-run < "$p" 2>/dev/null && patch -p1 < "$p" || echo "  [WARN] $p failed, apply manually"
-          done
+          # 用 sed 直接修改，不用 patch
+          if [ -f ggml/src/ggml-hexagon/htp/hex-dma.c ]; then
+            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory");\n        memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c 2>/dev/null || true
+          fi
+          if [ -f ggml/src/ggml-hexagon/ggml-hexagon.cpp ]; then
+            sed -i 's/4095/65535/' ggml/src/ggml-hexagon/ggml-hexagon.cpp 2>/dev/null || true
+          fi
+          if [ -f ggml/src/ggml-hexagon/htp-drv.cpp ]; then
+            sed -i 's/return 73;/return 81;/' ggml/src/ggml-hexagon/htp-drv.cpp 2>/dev/null || true
+          fi
 
       - name: Configure CMake
         working-directory: whisper.cpp
         run: |
-          cmake -B build-hexagon \
+          cmake -B build \
             -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI="$ANDROID_ABI" \
@@ -161,29 +103,36 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_HEXAGON=ON \
-            -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
+            -DHEXAGON_SDK_PATH="$HEXAGON_SDK_ROOT" \
+            -DHEXAGON_TOOLS_PATH="$HEXAGON_TOOLS_ROOT" \
+            -DHTP_ARCH_VERSION=v81 \
             -DGGML_OPENMP=OFF \
-            -DGGML_OPENCL=OFF \
             -DWHISPER_BUILD_EXAMPLES=ON \
-            -DWHISPER_BUILD_TESTS=ON \
-            -DCMAKE_C_FLAGS="-O3 -ffast-math -fno-finite-math-only -D_GNU_SOURCE" \
-            -DCMAKE_CXX_FLAGS="-O3 -ffast-math -fno-finite-math-only -D_GNU_SOURCE"
+            -DWHISPER_BUILD_TESTS=ON
 
       - name: Build
         working-directory: whisper.cpp
-        run: cmake --build build-hexagon --parallel $(nproc)
+        run: cmake --build build --parallel $(nproc)
 
       - name: Package
         working-directory: whisper.cpp
         run: |
-          mkdir -p pkg-android
-          find build-hexagon -name "*.so" -o -name "*.so.*" | xargs -I{} cp {} pkg-android/
-          find build-hexagon/bin -type f -executable | xargs -I{} cp {} pkg-android/
-          ls -la pkg-android/
+          mkdir -p pkg
+          find build -name "*.so" -o -name "*.so.*" | xargs -I{} cp {} pkg/
+          find build/bin -type f -executable | xargs -I{} cp {} pkg/ 2>/dev/null || true
+          cd pkg && zip -r ../whisper-hexagon-v81.zip . && cd ..
+          ls -la pkg/
 
-      - name: Upload artifacts
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: whisper-hexagon-v81-sm8850
-          path: whisper.cpp/pkg-android/*
+          name: whisper-hexagon-v81-android
+          path: whisper.cpp/whisper-hexagon-v81.zip
           retention-days: 30
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v81-build-${{ github.run_number }}
+          name: Whisper Hexagon v81 Build #${{ github.run_number }}
+          body:
