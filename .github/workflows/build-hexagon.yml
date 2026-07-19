@@ -48,7 +48,7 @@ jobs:
           wget -q --show-progress "$SDK_URL" -O hexagon-sdk.tar.gz
           
           mkdir -p hexagon-sdk
-          tar -xzf hexagon-sdk.tar.gz -C hexagon-sdk/
+          tar -xJf hexagon-sdk.tar.gz -C hexagon-sdk/
           
           # 检查关键文件
           if [ ! -f hexagon-sdk/hexagon_sdk.json ]; then
