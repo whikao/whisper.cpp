@@ -46,15 +46,6 @@ jobs:
           ls -la hexagon-sdk/
           find hexagon-sdk -maxdepth 3 -type d | sort | head -30
           
-          # 检查是否有嵌套目录
-          if [ -d "hexagon-sdk/Hexagon_SDK" ]; then
-            echo "Found nested Hexagon_SDK directory"
-            mv hexagon-sdk hexagon-sdk-tmp
-            mkdir hexagon-sdk
-            mv hexagon-sdk-tmp/Hexagon_SDK/* hexagon-sdk/ 2>/dev/null || true
-            rm -rf hexagon-sdk-tmp
-          fi
-          
           # 检查是否有版本号目录
           if [ -d "hexagon-sdk/6.6.0.0" ]; then
             echo "Found version directory"
@@ -64,11 +55,13 @@ jobs:
           fi
           
           echo "HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT" >> $GITHUB_ENV
+          echo "HEXAGON_SDK_PATH=$HEXAGON_SDK_ROOT" >> $GITHUB_ENV
           echo "HEXAGON_TOOLS_ROOT=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+          echo "HEXAGON_TOOLS_PATH=$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
           
           echo "=== Checking tools ==="
-          ls -la "$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/" 2>/dev/null || echo "No HEXAGON_Tools found"
-          find "$HEXAGON_SDK_ROOT" -name "hexagon-clang" 2>/dev/null || echo "No hexagon-clang"
+          ls -la "$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/"
+          find "$HEXAGON_SDK_ROOT" -name "hexagon-clang" | head -3
 
       - name: Checkout whisper.cpp
         uses: actions/checkout@v4
@@ -83,7 +76,8 @@ jobs:
         run: |
           # 用 sed 直接修改，不用 patch
           if [ -f ggml/src/ggml-hexagon/htp/hex-dma.c ]; then
-            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory");\n        memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c 2>/dev/null || true
+            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory");
+        memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c 2>/dev/null || true
           fi
           if [ -f ggml/src/ggml-hexagon/ggml-hexagon.cpp ]; then
             sed -i 's/4095/65535/' ggml/src/ggml-hexagon/ggml-hexagon.cpp 2>/dev/null || true
@@ -103,7 +97,9 @@ jobs:
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_HEXAGON=ON \
+            -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
             -DHEXAGON_SDK_PATH="$HEXAGON_SDK_ROOT" \
+            -DHEXAGON_TOOLS_ROOT="$HEXAGON_TOOLS_ROOT" \
             -DHEXAGON_TOOLS_PATH="$HEXAGON_TOOLS_ROOT" \
             -DHTP_ARCH_VERSION=v81 \
             -DGGML_OPENMP=OFF \
@@ -135,4 +131,15 @@ jobs:
         with:
           tag_name: v81-build-${{ github.run_number }}
           name: Whisper Hexagon v81 Build #${{ github.run_number }}
-          body:
+          body: |
+            Android Hexagon v81 构建产物 (SM8850)
+            
+            ## 使用
+            ```bash
+            adb push *.so /data/local/tmp/
+            adb push whisper-cli /data/local/tmp/
+            adb shell "export LD_LIBRARY_PATH=/data/local/tmp; export ADSP_LIBRARY_PATH=/data/local/tmp; export GGML_HEXAGON_ARCH=81; cd /data/local/tmp; ./whisper-cli -m model.bin -f audio.wav"
+            ```
+          files: whisper.cpp/whisper-hexagon-v81.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
