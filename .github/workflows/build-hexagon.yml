@@ -31,13 +31,14 @@ jobs:
           unzip -q android-ndk-r28-linux.zip
           echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
 
+      # 👇 核心修复：修改了解压后的路径判断逻辑
       - name: 下载并解压 Hexagon SDK v6.6.0.0
         run: |
           cd /tmp
           wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
           tar -xf hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
-          # 处理目录结构
-          if [ -d "/tmp/hexagon-sdk/6.6.0.0" ]; then
+          # 修复路径逻辑：直接查找 incs 目录所在的实际根路径
+          if [ -d "/tmp/hexagon-sdk/6.6.0.0/incs" ]; then
             echo "HEXAGON_SDK_ROOT=/tmp/hexagon-sdk/6.6.0.0" >> $GITHUB_ENV
             echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
           else
@@ -45,7 +46,6 @@ jobs:
             echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
           fi
 
-      # 👇 修复的地方在这里：增加了 find 查找逻辑，找不到也不报错中断
       - name: 修复官方 SDK 的 CMake 兼容性问题
         run: |
           CMAKE_FILE=$(find /tmp -path "*/build/cmake/hexagon_fun.cmake" 2>/dev/null | head -n 1)
@@ -56,7 +56,7 @@ jobs:
             echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
           fi
 
-      # 👇 按照你的要求，下面三个 sed 修改完全保留，没有变动
+      # 👇 按照你的要求，下面三个补丁原封不动，完全没有修改
       - name: 应用乱码修复补丁
         run: |
           # 补丁1: 修复缓存一致性 - hex-dma.c
