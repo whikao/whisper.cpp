@@ -74,10 +74,9 @@ jobs:
       - name: Apply patches
         working-directory: whisper.cpp
         run: |
-          # 用 sed 直接修改，不用 patch
+          # 用 sed 直接修改，不用 patch（单行处理，避免YAML换行问题）
           if [ -f ggml/src/ggml-hexagon/htp/hex-dma.c ]; then
-            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory");
-        memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c 2>/dev/null || true
+            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory"); memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c 2>/dev/null || true
           fi
           if [ -f ggml/src/ggml-hexagon/ggml-hexagon.cpp ]; then
             sed -i 's/4095/65535/' ggml/src/ggml-hexagon/ggml-hexagon.cpp 2>/dev/null || true
