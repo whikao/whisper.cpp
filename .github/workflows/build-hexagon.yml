@@ -31,19 +31,29 @@ jobs:
           unzip -q android-ndk-r28-linux.zip
           echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
 
-      # 👇 核心修复：修改了解压后的路径判断逻辑
+      # 👇【核心修复】自动查找包含 incs 的真实根目录，不再依赖硬编码文件夹名
       - name: 下载并解压 Hexagon SDK v6.6.0.0
         run: |
           cd /tmp
           wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
           tar -xf hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
-          # 修复路径逻辑：直接查找 incs 目录所在的实际根路径
-          if [ -d "/tmp/hexagon-sdk/6.6.0.0/incs" ]; then
-            echo "HEXAGON_SDK_ROOT=/tmp/hexagon-sdk/6.6.0.0" >> $GITHUB_ENV
-            echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/6.6.0.0/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+          # 动态自动定位包含 'incs' 的真实根目录
+          SDK_ROOT=$(find /tmp -maxdepth 3 -type d -name "incs" 2>/dev/null | head -n 1 | xargs dirname)
+          if [ -n "$SDK_ROOT" ]; then
+            echo "HEXAGON_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+            echo "✅ 成功定位 SDK 真实根目录: $SDK_ROOT"
+            # 在找到的 SDK 根目录下查找 Tools 路径
+            TOOLS_PATH=$(find $SDK_ROOT -path "*/HEXAGON_Tools/19.0.07" 2>/dev/null | head -n 1)
+            if [ -n "$TOOLS_PATH" ]; then
+              echo "HEXAGON_TOOLS_ROOT=$TOOLS_PATH" >> $GITHUB_ENV
+              echo "✅ 成功定位 Tools 目录: $TOOLS_PATH"
+            else
+              echo "❌ 错误: 在 SDK 根目录下未发现 HEXAGON_Tools/19.0.07！"
+              exit 1
+            fi
           else
-            echo "HEXAGON_SDK_ROOT=/tmp/hexagon-sdk" >> $GITHUB_ENV
-            echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
+            echo "❌ 错误: 解压后未找到包含 'incs' 文件夹的 SDK 目录，请检查解压包！"
+            exit 1
           fi
 
       - name: 修复官方 SDK 的 CMake 兼容性问题
@@ -56,7 +66,7 @@ jobs:
             echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
           fi
 
-      # 👇 按照你的要求，下面三个补丁原封不动，完全没有修改
+      # 👇【未改动】按照要求，乱码修复补丁完全保持原样，不进行调整
       - name: 应用乱码修复补丁
         run: |
           # 补丁1: 修复缓存一致性 - hex-dma.c
