@@ -43,7 +43,7 @@ jobs:
 
       - name: Setup Hexagon SDK
         run: |
-          SDK_URL="https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-6.6.0.0.tar.gz"
+          SDK_URL="https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz"
           echo "Downloading from $SDK_URL"
           wget -q --show-progress "$SDK_URL" -O hexagon-sdk.tar.gz
           
