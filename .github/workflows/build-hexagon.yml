@@ -70,19 +70,45 @@ jobs:
 
       - name: 应用乱码修复补丁
         run: |
-          # 补丁1: 修复缓存一致性 - hex-dma.c
-          if [ -f ggml/src/ggml-hexagon/htp/hex-dma.c ]; then
-            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory"); memcpy(dst, src, size);/' ggml/src/ggml-hexagon/htp/hex-dma.c
+          # 补丁1: 修复缓存一致性 - hex-dma.c（双向屏障）
+          HEX_DMA="ggml/src/ggml-hexagon/htp/hex-dma.c"
+          if [ -f "$HEX_DMA" ]; then
+            echo "=== hex-dma.c 原始 memcpy ==="
+            grep -n "memcpy(dst, src, size)" "$HEX_DMA" || true
+            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory");\n    memcpy(dst, src, size);\n    asm volatile("dsb ish" ::: "memory");/' "$HEX_DMA"
+            echo "✅ 修复 hex-dma.c 双向屏障"
+          else
+            echo "⚠️ 未找到 hex-dma.c"
           fi
           
           # 补丁2: 修复 ION 内存对齐 - ggml-hexagon.cpp
-          if [ -f ggml/src/ggml-hexagon/ggml-hexagon.cpp ]; then
-            sed -i 's/4095/65535/' ggml/src/ggml-hexagon/ggml-hexagon.cpp
+          HEX_CPP="ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          if [ -f "$HEX_CPP" ]; then
+            sed -i 's/4095/65535/' "$HEX_CPP"
+            echo "✅ 修复 ION 64KB 对齐"
           fi
           
           # 补丁3: 强制 v81 架构检测 - htp-drv.cpp
-          if [ -f ggml/src/ggml-hexagon/htp-drv.cpp ]; then
-            sed -i 's/return 73;/return 81;/' ggml/src/ggml-hexagon/htp-drv.cpp
+          # strings 显示 so 里有 "defaulting to v73"
+          DRV_FILE="ggml/src/ggml-hexagon/htp-drv.cpp"
+          if [ -f "$DRV_FILE" ]; then
+            echo "=== htp-drv.cpp 架构相关代码 ==="
+            grep -n "defaulting\|v73\|return.*73\|return.*81" "$DRV_FILE" || true
+            sed -i 's/defaulting to v73/defaulting to v81/' "$DRV_FILE"
+            sed -i 's/return 73;/return 81;/g' "$DRV_FILE"
+            sed -i 's/return 79;/return 81;/g' "$DRV_FILE"
+            echo "✅ 强制 v81 架构"
+          fi
+          
+          # 补丁4: 修复 HAP_power_set_HMX 指针错误（ggml官方已知bug）
+          MAIN_FILE="ggml/src/ggml-hexagon/htp/main.c"
+          if [ -f "$MAIN_FILE" ]; then
+            echo "=== main.c HAP_power_set ==="
+            grep -n "HAP_power_set" "$MAIN_FILE" || true
+            sed -i 's/HAP_power_set((void \*) \&ctx/HAP_power_set((void *) ctx/g' "$MAIN_FILE"
+            echo "✅ 修复 HAP_power_set 指针"
+          else
+            echo "⚠️ 未找到 main.c"
           fi
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构)
@@ -106,9 +132,13 @@ jobs:
       - name: 打包编译产物
         run: |
           mkdir -p pkg
-          find build -name "*.so" -o -name "*.so.*" | xargs -I{} cp {} pkg/
+          find build -name "*.so" | xargs -I{} cp {} pkg/
+          find build -name "*.so.*" | xargs -I{} cp {} pkg/
+          find build -path "*ggml-hexagon*" -name "libggml-htp*.so" -exec cp {} pkg/ \;
           find build/bin -type f -executable | xargs -I{} cp {} pkg/ 2>/dev/null || true
           cd pkg && zip -r ../whisper-hexagon-v81.zip . && cd ..
+          echo "=== 打包内容 ==="
+          ls -la pkg/
 
       - name: 上传编译产物 (Artifacts)
         uses: actions/upload-artifact@v4
