@@ -8,6 +8,10 @@ on:
         default: 'master'
         required: true
 
+# 👇【新增修复1】：显式赋予创建 Release 的写入权限
+permissions:
+  contents: write
+
 jobs:
   build-android-hexagon:
     runs-on: ubuntu-latest
@@ -31,7 +35,6 @@ jobs:
           unzip -q android-ndk-r28-linux.zip
           echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
 
-      # 👇【核心修复】自动查找包含 incs 的真实根目录，不再依赖硬编码文件夹名
       - name: 下载并解压 Hexagon SDK v6.6.0.0
         run: |
           cd /tmp
@@ -42,7 +45,6 @@ jobs:
           if [ -n "$SDK_ROOT" ]; then
             echo "HEXAGON_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
             echo "✅ 成功定位 SDK 真实根目录: $SDK_ROOT"
-            # 在找到的 SDK 根目录下查找 Tools 路径
             TOOLS_PATH=$(find $SDK_ROOT -path "*/HEXAGON_Tools/19.0.07" 2>/dev/null | head -n 1)
             if [ -n "$TOOLS_PATH" ]; then
               echo "HEXAGON_TOOLS_ROOT=$TOOLS_PATH" >> $GITHUB_ENV
@@ -66,7 +68,6 @@ jobs:
             echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
           fi
 
-      # 👇【未改动】按照要求，乱码修复补丁完全保持原样，不进行调整
       - name: 应用乱码修复补丁
         run: |
           # 补丁1: 修复缓存一致性 - hex-dma.c
@@ -116,8 +117,9 @@ jobs:
           path: whisper-hexagon-v81.zip
           if-no-files-found: error
 
+      # 👇【新增修复2】：升级创建 Release 的 Action 版本到 v2
       - name: 创建 Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: v81-build-${{ github.run_number }}
           name: Whisper Hexagon v81 Build #${{ github.run_number }}
