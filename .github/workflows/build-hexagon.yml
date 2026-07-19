@@ -45,10 +45,18 @@ jobs:
             echo "HEXAGON_TOOLS_ROOT=/tmp/hexagon-sdk/tools/HEXAGON_Tools/19.0.07" >> $GITHUB_ENV
           fi
 
+      # 👇 修复的地方在这里：增加了 find 查找逻辑，找不到也不报错中断
       - name: 修复官方 SDK 的 CMake 兼容性问题
         run: |
-          sed -i '99,106s/^/# /' ${{ env.HEXAGON_SDK_ROOT }}/build/cmake/hexagon_fun.cmake
+          CMAKE_FILE=$(find /tmp -path "*/build/cmake/hexagon_fun.cmake" 2>/dev/null | head -n 1)
+          if [ -n "$CMAKE_FILE" ]; then
+            sed -i '99,106s/^/# /' "$CMAKE_FILE"
+            echo "✅ 成功修复 CMake 文件: $CMAKE_FILE"
+          else
+            echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
+          fi
 
+      # 👇 按照你的要求，下面三个 sed 修改完全保留，没有变动
       - name: 应用乱码修复补丁
         run: |
           # 补丁1: 修复缓存一致性 - hex-dma.c
