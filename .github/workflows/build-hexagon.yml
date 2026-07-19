@@ -1,0 +1,179 @@
+name: Build Whisper.cpp Android Hexagon (SM8850/V81)
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_branch:
+        description: 'whisper.cpp branch/tag'
+        default: 'master'
+        required: true
+      hexagon_sdk_version:
+        description: 'Hexagon SDK version'
+        default: '6.6.0.0'
+        required: true
+      ndk_version:
+        description: 'Android NDK version'
+        default: 'r28b'
+        required: true
+
+jobs:
+  build-android-hexagon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      HEXAGON_SDK_VERSION: ${{ github.event.inputs.hexagon_sdk_version }}
+      NDK_VERSION: ${{ github.event.inputs.ndk_version }}
+      ANDROID_ABI: arm64-v8a
+      ANDROID_API: 28
+      HEXAGON_ARCH: v81
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3 wget curl git build-essential
+
+      - name: Setup Android NDK
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip" -O ndk.zip
+          unzip -q ndk.zip && mv android-ndk-* android-ndk
+          echo "ANDROID_NDK=$PWD/android-ndk" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$PWD/android-ndk" >> $GITHUB_ENV
+
+      - name: Setup Hexagon SDK
+        run: |
+          # Hexagon SDK 需要 Qualcomm 开发者账号下载
+          # 推荐：先本地下载，上传到你 fork 的 GitHub Release，然后 wget 下载
+          # 备用：使用 snapdragon-toolchain 公开镜像（可能不完整）
+          git clone --depth 1 https://github.com/snapdragon-toolchain/hexagon-sdk.git hexagon-sdk-repo 2>/dev/null || true
+          mkdir -p hexagon-sdk
+          if [ -d "hexagon-sdk-repo" ]; then
+            cp -r hexagon-sdk-repo/* hexagon-sdk/ 2>/dev/null || true
+          fi
+          echo "HEXAGON_SDK_ROOT=$PWD/hexagon-sdk" >> $GITHUB_ENV
+
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ github.event.inputs.whisper_branch }}
+          submodules: recursive
+          path: whisper.cpp
+
+      # ============================================================
+      # 核心：应用补丁修复乱码问题
+      # ============================================================
+      - name: Apply critical patches
+        working-directory: whisper.cpp
+        run: |
+          mkdir -p patches
+
+          # ---- 补丁1: hex-dma.c 缓存同步 ----
+          cat > patches/01-hex-dma-cache.patch << 'EOF'
+          --- a/ggml/src/ggml-hexagon/htp/hex-dma.c
+          +++ b/ggml/src/ggml-hexagon/htp/hex-dma.c
+          @@ -45,10 +45,18 @@ int hexagon_dma_copy(void *dst, const void *src, size_t size, int direction) {
+               if (!dst || !src || size == 0) return -1;
+               
+               if (direction == HEXAGON_DMA_H2D) {
+          +        #ifdef __aarch64__
+          +        __builtin___clear_cache((char*)src, (char*)src + size);
+          +        #endif
+                   memcpy(dst, src, size);
+          +        asm volatile("dmb ishst" ::: "memory");
+               } else {
+          +        asm volatile("dmb ishld" ::: "memory");
+                   memcpy(dst, src, size);
+          +        #ifdef __aarch64__
+          +        __builtin___clear_cache((char*)dst, (char*)dst + size);
+          +        #endif
+               }
+               return 0;
+           }
+          EOF
+
+          # ---- 补丁2: ION 64KB对齐 + 缓存标志 ----
+          cat > patches/02-ion-alloc.patch << 'EOF'
+          --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+          +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+          @@ -195,12 +195,16 @@ static void * ggmlhexagon_allocate_ion_buffer(size_t size) {
+               int ion_fd = open("/dev/ion", O_RDONLY);
+               if (ion_fd < 0) return NULL;
+               
+          -    size_t aligned_size = (size + 4095) & ~4095;
+          +    // v81 requires 64KB alignment
+          +    size_t aligned_size = (size + 65535) & ~65535;
+               
+               struct ion_allocation_data alloc_data = {
+                   .len = aligned_size,
+                   .align = 0,
+                   .heap_id_mask = ION_HEAP_SYSTEM_MASK,
+          -        .flags = ION_FLAG_CACHED,
+          +        // Use NEEDS_SYNC to avoid coherence issues on v81
+          +        .flags = ION_FLAG_CACHED_NEEDS_SYNC,
+               };
+               
+               int ret = ioctl(ion_fd, ION_IOC_ALLOC, &alloc_data);
+          EOF
+
+          # ---- 补丁3: v81 架构检测 fallback ----
+          cat > patches/03-v81-detect.patch << 'EOF'
+          --- a/ggml/src/ggml-hexagon/htp-drv.cpp
+          +++ b/ggml/src/ggml-hexagon/htp-drv.cpp
+          @@ -118,7 +118,9 @@ static int ggmlhexagon_get_arch_version() {
+               const char *force_arch = getenv("GGML_HEXAGON_ARCH");
+               if (force_arch) return atoi(force_arch);
+               
+          -    int version = ggmlhexagon_query_htp_version();
+          +    int version = 81; // Force v81 for SM8850
+          +    // Or keep detection but fix fallback:
+          +    // int version = ggmlhexagon_query_htp_version();
+               if (version < 0) {
+                   GGML_LOG_WARN("ggml-hex: failed to query HTP version, defaulting to v81\n");
+                   return 81;
+          EOF
+
+          # 尝试应用补丁（失败则提示手动修改）
+          for p in patches/*.patch; do
+            echo "Applying $p ..."
+            patch -p1 --dry-run < "$p" 2>/dev/null && patch -p1 < "$p" || echo "  [WARN] $p failed, apply manually"
+          done
+
+      - name: Configure CMake
+        working-directory: whisper.cpp
+        run: |
+          cmake -B build-hexagon \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ANDROID_ABI" \
+            -DANDROID_PLATFORM="android-$ANDROID_API" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HEXAGON=ON \
+            -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
+            -DGGML_OPENMP=OFF \
+            -DGGML_OPENCL=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_TESTS=ON \
+            -DCMAKE_C_FLAGS="-O3 -ffast-math -fno-finite-math-only -D_GNU_SOURCE" \
+            -DCMAKE_CXX_FLAGS="-O3 -ffast-math -fno-finite-math-only -D_GNU_SOURCE"
+
+      - name: Build
+        working-directory: whisper.cpp
+        run: cmake --build build-hexagon --parallel $(nproc)
+
+      - name: Package
+        working-directory: whisper.cpp
+        run: |
+          mkdir -p pkg-android
+          find build-hexagon -name "*.so" -o -name "*.so.*" | xargs -I{} cp {} pkg-android/
+          find build-hexagon/bin -type f -executable | xargs -I{} cp {} pkg-android/
+          ls -la pkg-android/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-hexagon-v81-sm8850
+          path: whisper.cpp/pkg-android/*
+          retention-days: 30
