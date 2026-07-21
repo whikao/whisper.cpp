@@ -8,7 +8,7 @@ on:
         default: 'master'
         required: true
 
-# 👇【新增修复1】：显式赋予创建 Release 的写入权限
+# 显式赋予创建 Release 的写入权限
 permissions:
   contents: write
 
@@ -68,48 +68,23 @@ jobs:
             echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
           fi
 
-      - name: 应用乱码修复补丁
+      # 【核心改动】用 llama.cpp 最新的 ggml-hexagon 整体覆盖 whisper.cpp 自带的旧版
+      # whisper.cpp 的 hexagon 同步停在 7-10，新版额外包含：
+      #   7-16  L2 缓存一致性重做（dirty bit 跟踪 + 延迟刷写）← 治乱码的主力修复
+      #   7-14  hmx-queue 信号枚举修复
+      #   7-20  CLAMP 算子；MUL_MAT / FLASH_ATTN 管线优化
+      # 旧的 4 个 sed 补丁全部废弃（hex-dma.c 在新版中已被官方删除重写，
+      # HAP_power_set 指针问题官方早已修复，架构检测在 SM8850 上本就正常）
+      - name: 覆盖最新 ggml-hexagon（含 L2 缓存重做 + HMX 修复）
         run: |
-          # 补丁1: 修复缓存一致性 - hex-dma.c（双向屏障）
-          HEX_DMA="ggml/src/ggml-hexagon/htp/hex-dma.c"
-          if [ -f "$HEX_DMA" ]; then
-            echo "=== hex-dma.c 原始 memcpy ==="
-            grep -n "memcpy(dst, src, size)" "$HEX_DMA" || true
-            sed -i 's/memcpy(dst, src, size);/asm volatile("dmb ishst" ::: "memory");\n    memcpy(dst, src, size);\n    asm volatile("dsb ish" ::: "memory");/' "$HEX_DMA"
-            echo "✅ 修复 hex-dma.c 双向屏障"
-          else
-            echo "⚠️ 未找到 hex-dma.c"
-          fi
-          
-          # 补丁2: 修复 ION 内存对齐 - ggml-hexagon.cpp
-          HEX_CPP="ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-          if [ -f "$HEX_CPP" ]; then
-            sed -i 's/4095/65535/' "$HEX_CPP"
-            echo "✅ 修复 ION 64KB 对齐"
-          fi
-          
-          # 补丁3: 强制 v81 架构检测 - htp-drv.cpp
-          # strings 显示 so 里有 "defaulting to v73"
-          DRV_FILE="ggml/src/ggml-hexagon/htp-drv.cpp"
-          if [ -f "$DRV_FILE" ]; then
-            echo "=== htp-drv.cpp 架构相关代码 ==="
-            grep -n "defaulting\|v73\|return.*73\|return.*81" "$DRV_FILE" || true
-            sed -i 's/defaulting to v73/defaulting to v81/' "$DRV_FILE"
-            sed -i 's/return 73;/return 81;/g' "$DRV_FILE"
-            sed -i 's/return 79;/return 81;/g' "$DRV_FILE"
-            echo "✅ 强制 v81 架构"
-          fi
-          
-          # 补丁4: 修复 HAP_power_set_HMX 指针错误（ggml官方已知bug）
-          MAIN_FILE="ggml/src/ggml-hexagon/htp/main.c"
-          if [ -f "$MAIN_FILE" ]; then
-            echo "=== main.c HAP_power_set ==="
-            grep -n "HAP_power_set" "$MAIN_FILE" || true
-            sed -i 's/HAP_power_set((void \*) \&ctx/HAP_power_set((void *) ctx/g' "$MAIN_FILE"
-            echo "✅ 修复 HAP_power_set 指针"
-          else
-            echo "⚠️ 未找到 main.c"
-          fi
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama
+          rm -rf ggml/src/ggml-hexagon
+          cp -r /tmp/llama/ggml/src/ggml-hexagon ggml/src/
+          cp -f /tmp/llama/ggml/include/ggml-hexagon.h ggml/include/ggml-hexagon.h
+          echo "=== 覆盖完成，新版关键默认值（应显示 mm_select=3 / fa_select=2）==="
+          grep -n "opt_mm_select = \|opt_fa_select = " ggml/src/ggml-hexagon/ggml-hexagon.cpp || true
+          echo "=== 确认新版文件就位（应有 dma-queue.c / work-queue.c / htp-tensor.c）==="
+          ls ggml/src/ggml-hexagon/htp/ || true
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构)
         run: |
@@ -147,7 +122,6 @@ jobs:
           path: whisper-hexagon-v81.zip
           if-no-files-found: error
 
-      # 👇【新增修复2】：升级创建 Release 的 Action 版本到 v2
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
@@ -155,18 +129,24 @@ jobs:
           name: Whisper Hexagon v81 Build #${{ github.run_number }}
           body: |
             Android Hexagon v81 构建产物 (SM8850)
-            
-            ## 已应用的乱码修复补丁
-            1. **hex-dma.c**: 添加 AP↔DSP 缓存同步（`dmb ishst`）
-            2. **ggml-hexagon.cpp**: ION 内存 64KB 对齐
-            3. **htp-drv.cpp**: 强制使用 v81 架构
-            
-            ## 使用
+
+            ## 本版改动
+            - 用 llama.cpp 最新 ggml-hexagon 整体覆盖（whisper.cpp 自带版停在 7-10）
+            - 新增：L2 缓存一致性重做（dirty bit 跟踪 + 延迟刷写）
+            - 新增：hmx-queue 修复、MUL_MAT / FLASH_ATTN 管线优化
+            - 已废弃旧的 4 个 sed 补丁（hex-dma.c 在新版中被官方删除重写）
+
+            ## Termux 使用
             ```bash
-            adb push *.so /data/local/tmp/
-            adb push whisper-cli /data/local/tmp/
-            adb shell "export LD_LIBRARY_PATH=/data/local/tmp; export ADSP_LIBRARY_PATH=/data/local/tmp; export GGML_HEXAGON_ARCH=81; cd /data/local/tmp; ./whisper-cli -m model.bin -f audio.wav"
+            export LD_LIBRARY_PATH=.:/vendor/lib64
+            # 模型必须用 Q4_0 / Q4_1 / Q8_0（Q5_0 不支持 NPU 加速）
+            # 直接跑（缓存修复后 HMX 应可正常工作）：
+            ./whisper-cli -m ggml-large-v3-turbo-q8_0.bin -f audio.wav --output-srt
+            # 若仍乱码按序尝试：
+            # GGML_HEXAGON_FA_SELECT=1 ./whisper-cli ...
+            # GGML_HEXAGON_OPFILTER="FLASH_ATTN_EXT" ./whisper-cli ...
             ```
+            注意：whisper-cli、libggml*.so、libggml-htp-v81.so 必须整套换新，不要新旧混用
           files: whisper-hexagon-v81.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
