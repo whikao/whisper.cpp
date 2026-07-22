@@ -25,8 +25,12 @@ jobs:
       - name: Install glslc + deps (x86 新版，编 shader 用)
         run: |
           sudo apt-get update
-          sudo apt-get install -y glslc spirv-headers cmake ninja-build
-          glslc --version   # 日志里确认版本够新
+          sudo apt-get install -y glslc cmake ninja-build
+          glslc --version
+          # SPIRV-Headers 从源码安装（apt 包没有 CMake config，find_package 找不到）
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
+          cmake -S SPIRV-Headers -B spvh-build -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/spv-install
+          cmake --build spvh-build --target install
 
       - name: Setup Android NDK
         run: |
@@ -50,6 +54,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme" \
             -DVulkan_LIBRARY=$SYSROOT/usr/lib/aarch64-linux-android/28/libvulkan.so \
             -DVulkan_INCLUDE_DIR=$SYSROOT/usr/include \
+            -DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/spv-install \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_EXAMPLES=ON \
