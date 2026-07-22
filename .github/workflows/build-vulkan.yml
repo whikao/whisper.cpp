@@ -32,6 +32,7 @@ jobs:
           cmake -S SPIRV-Headers -B spvh-build -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/spv-install
           cmake --build spvh-build --target install
           ls $GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers/
+          ls $GITHUB_WORKSPACE/spv-install/include/spirv/unified1/spirv.hpp
           # Vulkan-Headers：NDK 没有 vulkan.hpp（C++ 头），从这里拿
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
           ls Vulkan-Headers/include/vulkan/vulkan.hpp
@@ -47,6 +48,7 @@ jobs:
         run: |
           SYSROOT=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot
           VK_INC=$GITHUB_WORKSPACE/Vulkan-Headers/include
+          SPV_INC=$GITHUB_WORKSPACE/spv-install/include
 
           cmake -B build-vk -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
@@ -55,8 +57,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_VULKAN=ON \
             -DGGML_NATIVE=OFF \
-            -DCMAKE_C_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme -I$VK_INC" \
-            -DCMAKE_CXX_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme -I$VK_INC" \
+            -DCMAKE_C_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme -I$VK_INC -I$SPV_INC" \
+            -DCMAKE_CXX_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme -I$VK_INC -I$SPV_INC" \
             -DVulkan_LIBRARY=$SYSROOT/usr/lib/aarch64-linux-android/28/libvulkan.so \
             -DVulkan_INCLUDE_DIR=$VK_INC \
             -DSPIRV-Headers_DIR=$GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers \
