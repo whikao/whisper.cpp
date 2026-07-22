@@ -25,7 +25,7 @@ jobs:
       - name: Install glslc + deps (x86 新版，编 shader 用)
         run: |
           sudo apt-get update
-          sudo apt-get install -y glslc cmake ninja-build
+          sudo apt-get install -y glslc spirv-headers cmake ninja-build
           glslc --version   # 日志里确认版本够新
 
       - name: Setup Android NDK
