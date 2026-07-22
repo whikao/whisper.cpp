@@ -31,6 +31,9 @@ jobs:
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
           cmake -S SPIRV-Headers -B spvh-build -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/spv-install
           cmake --build spvh-build --target install
+          # 验证 config 文件确实存在，失败会在这里就报错
+          ls -la $GITHUB_WORKSPACE/spv-install/lib/cmake/SPIRV-Headers/ || \
+          ls -la $GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers/
 
       - name: Setup Android NDK
         run: |
@@ -43,6 +46,13 @@ jobs:
         run: |
           SYSROOT=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot
 
+          # SPIRV-Headers 的 config 装在 lib 还是 share 下，自动探测
+          SPVH_DIR=$GITHUB_WORKSPACE/spv-install/lib/cmake/SPIRV-Headers
+          if [ ! -f "$SPVH_DIR/SPIRV-HeadersConfig.cmake" ]; then
+            SPVH_DIR=$GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers
+          fi
+          echo "Using SPIRV-Headers_DIR=$SPVH_DIR"
+
           cmake -B build-vk -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
@@ -54,7 +64,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme" \
             -DVulkan_LIBRARY=$SYSROOT/usr/lib/aarch64-linux-android/28/libvulkan.so \
             -DVulkan_INCLUDE_DIR=$SYSROOT/usr/include \
-            -DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/spv-install \
+            -DSPIRV-Headers_DIR=$SPVH_DIR \
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_EXAMPLES=ON \
