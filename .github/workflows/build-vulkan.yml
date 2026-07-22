@@ -66,7 +66,6 @@ jobs:
             -DVulkan_INCLUDE_DIR=$SYSROOT/usr/include \
             -DSPIRV-Headers_DIR=$SPVH_DIR \
             -DBUILD_SHARED_LIBS=ON \
-            -DGGML_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_SERVER=OFF
