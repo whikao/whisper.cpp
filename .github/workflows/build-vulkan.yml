@@ -27,13 +27,64 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y glslc cmake ninja-build
           glslc --version
-          # SPIRV-Headers 从源码安装（apt 包没有 CMake config，find_package 找不到）
+          # SPIRV-Headers：apt 包没有 CMake config，从源码装
           git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
           cmake -S SPIRV-Headers -B spvh-build -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/spv-install
           cmake --build spvh-build --target install
-          # 验证 config 文件确实存在，失败会在这里就报错
-          ls -la $GITHUB_WORKSPACE/spv-install/lib/cmake/SPIRV-Headers/ || \
-          ls -la $GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers/
+          ls $GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers/
+          # Vulkan-Headers：NDK 没有 vulkan.hpp（C++ 头），从这里拿
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
+          ls Vulkan-Headers/include/vulkan/vulkan.hpp
+
+      - name: Setup Android NDK
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip
+          unzip -q android-ndk-${{ env.NDK_VERSION }}-linux.zip
+          echo "ANDROID_NDK=$GITHUB_WORKSPACE/android-ndk-${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      - name: Configure (cross-compile aarch64 + Vulkan)
+        working-directory: whisper.cpp
+        run: |
+          SYSROOT=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          VK_INC=$GITHUB_WORKSPACE/Vulkan-Headers/include
+
+          cmake -B build-vk -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_C_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme -I$VK_INC" \
+            -DCMAKE_CXX_FLAGS="-march=armv9.2-a+dotprod+fp16+i8mm+sve2+sme -I$VK_INC" \
+            -DVulkan_LIBRARY=$SYSROOT/usr/lib/aarch64-linux-android/28/libvulkan.so \
+            -DVulkan_INCLUDE_DIR=$VK_INC \
+            -DSPIRV-Headers_DIR=$GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers \
+            -DBUILD_SHARED_LIBS=ON \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=OFF
+
+      - name: Build
+        working-directory: whisper.cpp
+        run: cmake --build build-vk -j$(nproc)
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp whisper.cpp/build-vk/bin/whisper-cli dist/ 2>/dev/null || \
+          cp whisper.cpp/build-vk/bin/main dist/whisper-cli
+          cp whisper.cpp/build-vk/bin/*.so dist/ 2>/dev/null || true
+          find whisper.cpp/build-vk -name "libggml*.so" -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-adreno-arm64
+          path: dist/
+          compression-level: 0
+          retention-days: 7
 
       - name: Setup Android NDK
         run: |
