@@ -23,6 +23,7 @@ on:
           - prof
           - hmxfix
           - hmxdbg
+          - hmxfix2
         default: 'kernelfix'
         required: true
 
@@ -147,6 +148,22 @@ jobs:
 
               open(tpath, "w").write(tsrc)
               print("OK: hmxdbg applied to ggml-hexagon.cpp (2 anchors)")
+              raise SystemExit(0)
+
+          if mode == "hmxfix2":
+              # 彻底放开 HMX 行数门槛：decode M=3 (bs3 bo3) 也走 HMX
+              # 日志实测 decode matmul m=3 elig=0 被门槛拦截；encoder m=1500/448 本就走 HMX
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new = "    if (m < 1) { // SM8850 v81: HMX for any M (decode M=3)"
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: hmxfix2 anchor not found in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: hmxfix2 applied to ggml-hexagon.cpp")
               raise SystemExit(0)
 
           if mode == "prof":
