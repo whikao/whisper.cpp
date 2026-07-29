@@ -21,6 +21,7 @@ on:
           - flushfix
           - flushfix2
           - prof
+          - hmxfix
         default: 'kernelfix'
         required: true
 
@@ -105,6 +106,22 @@ jobs:
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
           
+          if mode == "hmxfix":
+              # 放宽 HMX 矩阵乘的行数门槛：M=4 (bs3 bo3) 也走 HMX
+              # 实测 bs5 bo5 (M=6) 走 HMX 后每行吞吐为 HVX 的 1.7 倍
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new = "    if (m < HTP_MM_HMX_MIN_NROWS) { // SM8850 v81: allow M=4 on HMX"
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: hmxfix anchor not found in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: hmxfix applied to ggml-hexagon.cpp")
+              raise SystemExit(0)
+
           if mode == "prof":
               # 诊断版：把 profile 逐算子耗时日志从 DEBUG 提为 INFO（release 构建可见）
               # 运行时配合 GGML_HEXAGON_PROFILE=3（或1）使用
