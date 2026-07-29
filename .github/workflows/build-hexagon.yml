@@ -167,7 +167,6 @@ jobs:
             -DHEXAGON_TOOLS_ROOT=${{ env.HEXAGON_TOOLS_ROOT }} \
             -DHTP_ARCH_VERSION=v81 \
             -DWHISPER_BUILD_TESTS=ON \
-            -DGGML_BUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: 开始多线程编译
