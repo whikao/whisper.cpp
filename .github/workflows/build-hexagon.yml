@@ -109,7 +109,7 @@ jobs:
               tsrc = open(tpath).read()
 
               t_old = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && is_tensor_dirty(ctx, t)) {"
-              t_new = "        if (t && (t->flags & HTP_TENSOR_COMPUTE)) { // SM8850 v81 fix: unconditional flush, bypass dirty tracking"
+              t_new = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && (is_tensor_dirty(ctx, t) || true)) { // SM8850 v81 fix: unconditional flush"
 
               if tsrc.count(t_old) != 1:
                   print("ERROR: flushfix anchor not found in htp-tensor.c, abort!")
