@@ -452,8 +452,8 @@ jobs:
           "$CXX" --version
           echo "=== 主构建产出的 ggml 库 ==="
           find build -name "libggml*.so*" | sort
-          # 链接主构建全部 libggml*.so（含 libggml-hexagon.so；htp-v81 由 dlopen 加载）
-          GGML_LIBS=$(find build -name "libggml*.so" | sort | tr '\n' ' ')
+          # 只链接宿主侧库 build/bin/libggml*.so（排除 DSP 侧 libggml-htp-vXX.so，非 aarch64）
+          GGML_LIBS=$(find build/bin -maxdepth 1 -name "libggml*.so" | sort | tr '\n' ' ')
           echo "=== 链接库: $GGML_LIBS ==="
           mkdir -p pkg
           "$CXX" -std=c++17 -O2 -fPIC -pthread \
