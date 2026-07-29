@@ -26,6 +26,7 @@ on:
           - hmxfix2
           - hmxdbg2
           - q8mm
+          - q8mm2
         default: 'kernelfix'
         required: true
 
@@ -230,6 +231,63 @@ jobs:
                   raise SystemExit(1)
               open(tpath, "w").write(tsrc.replace(t_old, t_new))
               print("OK: q8mm applied to ggml-hexagon.cpp")
+              raise SystemExit(0)
+
+          if mode == "q8mm2":
+              # q8mm + 修复 q8 输出为空的真凶：
+              # lm-head（输出投影, ne1=51866）被 supported_mul_mat 的 ne[1] > 32768
+              # 硬限制拒绝 -> 回退 CPU -> CPU 把已被 set_tensor tiled-repack 的权重
+              # 当原始 q8 布局读 -> logits 全乱 -> 立即 EOT -> 空字幕。
+              # 修复：set_tensor/get_tensor 对 ne[1] > 32768 的量化 tensor 跳过
+              # repack/untile（保持原始布局）。该条件与 NPU 支持检查完全互斥
+              # （这种 tensor 永远只能走 CPU），无副作用。
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              # 1) 同 q8mm：把任意 hexagon buffer 视为 repack
+              q_old = ("    if (!opt_hostbuf) {\n"
+                       "        return ggml_backend_buffer_is_hexagon(b);\n"
+                       "    }\n"
+                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
+              q_new = ("    // SM8850 q8mm2: treat any hexagon buffer as repack\n"
+                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
+                       "    return ggml_backend_buffer_is_hexagon(b);")
+              if tsrc.count(q_old) != 1:
+                  print("ERROR: q8mm2 anchor-1 (is_hexagon_repack) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(q_old, q_new)
+
+              # 2) set_tensor：ne[1] > 32768 的量化权重保持原始布局
+              s_old = ('    HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
+              s_new = (s_old +
+                       "\n"
+                       "    // SM8850 q8mm2: tensors with ne[1] > 32768 are always refused by\n"
+                       "    // supported_mul_mat and run on CPU, so keep their original (non-tiled) layout.\n"
+                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
+                       "        memcpy((char *) tensor->data + offset, data, size);\n"
+                       "        return;\n"
+                       "    }\n")
+              if tsrc.count(s_old) != 1:
+                  print("ERROR: q8mm2 anchor-2 (set_tensor) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(s_old, s_new)
+
+              # 3) get_tensor：对称地按原始布局读回
+              g_old = ('    HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
+              g_new = (g_old +
+                       "\n"
+                       "    // SM8850 q8mm2: mirror of set_tensor guard for CPU-fallback weights.\n"
+                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
+                       "        memcpy(data, (const char *) tensor->data + offset, size);\n"
+                       "        return;\n"
+                       "    }\n")
+              if tsrc.count(g_old) != 1:
+                  print("ERROR: q8mm2 anchor-3 (get_tensor) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(g_old, g_new)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: q8mm2 applied to ggml-hexagon.cpp (3 sites)")
               raise SystemExit(0)
 
           if mode == "prof":
