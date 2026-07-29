@@ -7,6 +7,15 @@ on:
         description: 'whisper.cpp branch'
         default: 'master'
         required: true
+      patch_mode:
+        description: 'ADD 算子补丁：none=不打补丁, fp16=非fp32回退CPU, broadcast=广播/非连续回退CPU'
+        type: choice
+        options:
+          - none
+          - fp16
+          - broadcast
+        default: 'none'
+        required: true
 
 # 显式赋予创建 Release 的写入权限
 permissions:
@@ -69,12 +78,6 @@ jobs:
           fi
 
       # 【核心改动】用 llama.cpp 最新的 ggml-hexagon 整体覆盖 whisper.cpp 自带的旧版
-      # whisper.cpp 的 hexagon 同步停在 7-10，新版额外包含：
-      #   7-16  L2 缓存一致性重做（dirty bit 跟踪 + 延迟刷写）← 治乱码的主力修复
-      #   7-14  hmx-queue 信号枚举修复
-      #   7-20  CLAMP 算子；MUL_MAT / FLASH_ATTN 管线优化
-      # 旧的 4 个 sed 补丁全部废弃（hex-dma.c 在新版中已被官方删除重写，
-      # HAP_power_set 指针问题官方早已修复，架构检测在 SM8850 上本就正常）
       - name: 覆盖最新 ggml-hexagon（含 L2 缓存重做 + HMX 修复）
         run: |
           git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama
@@ -86,7 +89,72 @@ jobs:
           echo "=== 确认新版文件就位（应有 dma-queue.c / work-queue.c / htp-tensor.c）==="
           ls ggml/src/ggml-hexagon/htp/ || true
 
-      - name: 配置 CMake (启用 Hexagon 后端, v81 架构)
+      # 【ADD 补丁】在覆盖之后、编译之前打。找不到锚点会显式报错（防止白编）
+      - name: 按需打 ADD 算子补丁 (patch_mode=${{ inputs.patch_mode }})
+        run: |
+          python3 - << 'EOF'
+          mode = "${{ inputs.patch_mode }}"
+          if mode == "none":
+              print("patch_mode=none，跳过补丁")
+              raise SystemExit(0)
+
+          path = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          src = open(path).read()
+
+          old = """        case GGML_OP_MUL:
+                  case GGML_OP_ADD:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;"""
+
+          fp16_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: non-fp32 ADD is broken on HTP, fall back to CPU
+                      if (supp && (op->src[0]->type != GGML_TYPE_F32 ||
+                                   op->src[1]->type != GGML_TYPE_F32)) {
+                          supp = false;
+                      }
+                      break;"""
+
+          bcast_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: broadcast/non-contiguous ADD is broken on HTP, fall back to CPU
+                      if (supp && (!ggml_is_contiguous(op->src[0]) ||
+                                   !ggml_is_contiguous(op->src[1]) ||
+                                   op->src[0]->ne[0] != op->src[1]->ne[0] ||
+                                   op->src[0]->ne[1] != op->src[1]->ne[1] ||
+                                   op->src[0]->ne[2] != op->src[1]->ne[2] ||
+                                   op->src[0]->ne[3] != op->src[1]->ne[3])) {
+                          supp = false;
+                      }
+                      break;"""
+
+          new = fp16_new if mode == "fp16" else bcast_new
+
+          if src.count(old) != 1:
+              print("❌ 补丁锚点未找到（llama.cpp 上游代码可能已变动），中止构建，避免白编！")
+              raise SystemExit(1)
+
+          open(path, "w").write(src.replace(old, new))
+          print(f"✅ 已打入 {mode} 补丁")
+          EOF
+          echo "=== 补丁后的 ADD 分支 ==="
+          grep -n -A 12 "case GGML_OP_ADD:" ggml/src/ggml-hexagon/ggml-hexagon.cpp | head -40
+
+      - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
           mkdir -p build && cd build
           cmake .. \
@@ -98,6 +166,8 @@ jobs:
             -DHEXAGON_SDK_ROOT=${{ env.HEXAGON_SDK_ROOT }} \
             -DHEXAGON_TOOLS_ROOT=${{ env.HEXAGON_TOOLS_ROOT }} \
             -DHTP_ARCH_VERSION=v81 \
+            -DWHISPER_BUILD_TESTS=ON \
+            -DGGML_BUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: 开始多线程编译
@@ -119,33 +189,32 @@ jobs:
       - name: 上传编译产物 (Artifacts)
         uses: actions/upload-artifact@v4
         with:
-          name: whisper-hexagon-v81-android
+          name: whisper-hexagon-v81-${{ inputs.patch_mode }}-android
           path: whisper-hexagon-v81.zip
           if-no-files-found: error
 
       - name: 创建 Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v81-build-${{ github.run_number }}
-          name: Whisper Hexagon v81 Build #${{ github.run_number }}
+          tag_name: v81-${{ inputs.patch_mode }}-build-${{ github.run_number }}
+          name: Whisper Hexagon v81 [${{ inputs.patch_mode }}] Build #${{ github.run_number }}
           body: |
             Android Hexagon v81 构建产物 (SM8850)
+            补丁模式: ${{ inputs.patch_mode }}
 
             ## 本版改动
             - 用 llama.cpp 最新 ggml-hexagon 整体覆盖（whisper.cpp 自带版停在 7-10）
             - 新增：L2 缓存一致性重做（dirty bit 跟踪 + 延迟刷写）
             - 新增：hmx-queue 修复、MUL_MAT / FLASH_ATTN 管线优化
-            - 已废弃旧的 4 个 sed 补丁（hex-dma.c 在新版中被官方删除重写）
+            - 新增：WHISPER_BUILD_TESTS / GGML_BUILD_TESTS=ON，产物含 test-backend-ops
+            - patch_mode=${{ inputs.patch_mode }}（none=无补丁 / fp16=非fp32 ADD回退CPU / broadcast=广播ADD回退CPU）
 
             ## Termux 使用
             ```bash
             export LD_LIBRARY_PATH=.:/vendor/lib64
-            # 模型必须用 Q4_0 / Q4_1 / Q8_0（Q5_0 不支持 NPU 加速）
-            # 直接跑（缓存修复后 HMX 应可正常工作）：
             ./whisper-cli -m ggml-large-v3-turbo-q8_0.bin -f audio.wav --output-srt
-            # 若仍乱码按序尝试：
-            # GGML_HEXAGON_FA_SELECT=1 ./whisper-cli ...
-            # GGML_HEXAGON_OPFILTER="FLASH_ATTN_EXT" ./whisper-cli ...
+            # 算子正确性测试：
+            ./test-backend-ops -b HTP0 -o ADD
             ```
             注意：whisper-cli、libggml*.so、libggml-htp-v81.so 必须整套换新，不要新旧混用
           files: whisper-hexagon-v81.zip
