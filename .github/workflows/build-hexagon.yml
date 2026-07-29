@@ -18,6 +18,7 @@ on:
           - noncontig_only
           - kernelfix
           - krowbcast
+          - flushfix
         default: 'kernelfix'
         required: true
 
@@ -102,6 +103,21 @@ jobs:
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
           
+          if mode == "flushfix":
+              # 修缓存层：对所有 compute 输入无条件 flush，绕过 dirty 区间跟踪（htp/htp-tensor.c）
+              tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
+              tsrc = open(tpath).read()
+
+              t_old = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && is_tensor_dirty(ctx, t)) {"
+              t_new = "        if (t && (t->flags & HTP_TENSOR_COMPUTE)) { // SM8850 v81 fix: unconditional flush, bypass dirty tracking"
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: flushfix anchor not found in htp-tensor.c, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: flushfix applied to htp-tensor.c")
+              raise SystemExit(0)
+
           if mode in ("kernelfix", "krowbcast"):
               # 修 kernel：收紧 same_shape 判定；kernelfix=禁用row_bcast，krowbcast=保留row_bcast
               kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
