@@ -443,8 +443,12 @@ jobs:
         run: |
           set -e
           set -x
-          echo "=== 检查 test-backend-ops 源码 ==="
-          SRC=/tmp/llama/tests/test-backend-ops.cpp
+          echo "=== 下载 test-backend-ops 源码（固定 7-09 commit，匹配 whisper 的 ggml 快照） ==="
+          # master 版的测试源码引用了 dsv4_hc / lightning_indexer 等新算子，
+          # whisper.cpp 的 ggml 快照（约 7-10）没有这些符号，链接会失败。
+          # 故用 2026-07-09 的 commit f84a51940375 版本（q8 hexagon 支持已存在，新算子未引入）。
+          SRC=/tmp/test-backend-ops.cpp
+          curl -sL --fail https://raw.githubusercontent.com/ggml-org/llama.cpp/f84a5194037564a8231674ee807b3afb4a95a39a/tests/test-backend-ops.cpp -o "$SRC"
           ls -la "$SRC"
           # 与主构建一致：NDK r28 aarch64-linux-android clang++，arm64-v8a，最高 API level
           CXX=$(ls ${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang++ | sort -V | tail -n 1)
