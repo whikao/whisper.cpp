@@ -100,41 +100,73 @@ jobs:
           if mode == "none":
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
-
+          
+          if mode == "kernelfix":
+              # 修 kernel：收紧 same_shape 判定 + 禁用 row_bcast 快路径，广播 ADD 走 complex 正确路径
+              kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
+              ksrc = open(kpath).read()
+          
+              k_old = (
+                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&\n"
+                  "               (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&\n"
+                  "               (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);\n"
+                  "\n"
+                  "    bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);")
+          
+              k_new = (
+                  "    // SM8850 v81 fix: same_shape requires full 4-dim equality (dim-broadcast DMA read OOB)\n"
+                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == src0->ne[1]) &&\n"
+                  "               (src1->ne[2] == src0->ne[2]) &&\n"
+                  "               (src1->ne[3] == src0->ne[3]);\n"
+                  "\n"
+                  "    // SM8850 v81 fix: disable row_bcast fast path; broadcast ADD goes to complex path\n"
+                  "    bool is_row_bcast = false;")
+          
+              if ksrc.count(k_old) != 1:
+                  print("ERROR: kernel patch anchor not found in binary-ops.c, abort!")
+                  raise SystemExit(1)
+              open(kpath, "w").write(ksrc.replace(k_old, k_new))
+              print("OK: kernelfix applied to binary-ops.c")
+              raise SystemExit(0)
+          
           path = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
           src = open(path).read()
-
+          
           old = """        case GGML_OP_MUL:
                   case GGML_OP_ADD:
                   case GGML_OP_SUB:
                   case GGML_OP_DIV:
                       supp = ggml_hexagon_supported_binary(sess, op);
                       break;"""
-
+          
           fp16_new = """        case GGML_OP_MUL:
                   case GGML_OP_SUB:
                   case GGML_OP_DIV:
                       supp = ggml_hexagon_supported_binary(sess, op);
                       break;
-
+          
                   case GGML_OP_ADD:
                       supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: non-fp32 ADD is broken on HTP, fall back to CPU
+                      // SM8850 v81 workaround: non-fp32 ADD broken on HTP, fall back to CPU
                       if (supp && (op->src[0]->type != GGML_TYPE_F32 ||
                                    op->src[1]->type != GGML_TYPE_F32)) {
                           supp = false;
                       }
                       break;"""
-
+          
           bcast_new = """        case GGML_OP_MUL:
                   case GGML_OP_SUB:
                   case GGML_OP_DIV:
                       supp = ggml_hexagon_supported_binary(sess, op);
                       break;
-
+          
                   case GGML_OP_ADD:
                       supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: broadcast/non-contiguous ADD is broken on HTP, fall back to CPU
+                      // SM8850 v81 workaround: broadcast/non-contiguous ADD broken on HTP, fall back to CPU
                       if (supp && (!ggml_is_contiguous(op->src[0]) ||
                                    !ggml_is_contiguous(op->src[1]) ||
                                    op->src[0]->ne[0] != op->src[1]->ne[0] ||
@@ -144,16 +176,16 @@ jobs:
                           supp = false;
                       }
                       break;"""
-
+          
           bcast_only_new = """        case GGML_OP_MUL:
                   case GGML_OP_SUB:
                   case GGML_OP_DIV:
                       supp = ggml_hexagon_supported_binary(sess, op);
                       break;
-
+          
                   case GGML_OP_ADD:
                       supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: broadcast ADD broken on HTP, fall back to CPU
+                      // SM8850 v81 workaround: broadcast/non-contiguous ADD broken on HTP, fall back to CPU
                       if (supp && (op->src[0]->ne[0] != op->src[1]->ne[0] ||
                                    op->src[0]->ne[1] != op->src[1]->ne[1] ||
                                    op->src[0]->ne[2] != op->src[1]->ne[2] ||
@@ -161,13 +193,13 @@ jobs:
                           supp = false;
                       }
                       break;"""
-
+          
           noncontig_only_new = """        case GGML_OP_MUL:
                   case GGML_OP_SUB:
                   case GGML_OP_DIV:
                       supp = ggml_hexagon_supported_binary(sess, op);
                       break;
-
+          
                   case GGML_OP_ADD:
                       supp = ggml_hexagon_supported_binary(sess, op);
                       // SM8850 v81 workaround: non-contiguous ADD broken on HTP, fall back to CPU
@@ -176,50 +208,20 @@ jobs:
                           supp = false;
                       }
                       break;"""
-
-          if mode == "kernelfix":
-              # 修 kernel：收紧 same_shape 判定 + 禁用 row_bcast 快路径，
-              # 让所有广播 ADD 统一走 complex 正确路径（htp/binary-ops.c）
-              kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
-              ksrc = open(kpath).read()
-
-              k_old = """      bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
-                     (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&
-                     (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
-                     (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
-                     (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
-
-          bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);"""
-
-              k_new = """      // SM8850 v81 fix: same_shape 要求4维全等（原 dim 广播分支 DMA 越界读 src1）
-      bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
-                     (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&
-                     (src1->ne[1] == src0->ne[1]) &&
-                     (src1->ne[2] == src0->ne[2]) &&
-                     (src1->ne[3] == src0->ne[3]);
-
-          // SM8850 v81 fix: 禁用 row_bcast 快路径，广播 ADD 统一走 complex 正确路径
-          bool is_row_bcast = false;"""
-
-              if ksrc.count(k_old) != 1:
-                  print("❌ kernel 补丁锚点未找到（binary-ops.c 已变动），中止构建！")
-                  raise SystemExit(1)
-              open(kpath, "w").write(ksrc.replace(k_old, k_new))
-              print("✅ 已打入 kernelfix 补丁（binary-ops.c）")
-              raise SystemExit(0)
-
+          
           new = {"fp16": fp16_new, "broadcast": bcast_new,
                  "bcast_only": bcast_only_new, "noncontig_only": noncontig_only_new}[mode]
-
+          
           if src.count(old) != 1:
-              print("❌ 补丁锚点未找到（llama.cpp 上游代码可能已变动），中止构建，避免白编！")
+              print("ERROR: patch anchor not found (upstream changed), abort!")
               raise SystemExit(1)
-
+          
           open(path, "w").write(src.replace(old, new))
-          print(f"✅ 已打入 {mode} 补丁")
+          print("OK: %s patch applied" % mode)
           EOF
-          echo "=== 补丁后的 ADD 分支 ==="
-          grep -n -A 12 "case GGML_OP_ADD:" ggml/src/ggml-hexagon/ggml-hexagon.cpp | head -40
+          echo "=== patched ADD branch ==="
+          grep -n -A 12 "case GGML_OP_ADD:" ggml/src/ggml-hexagon/ggml-hexagon.cpp | head -40 || true
+          grep -n "is_row_bcast = false" ggml/src/ggml-hexagon/htp/binary-ops.c || true
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
