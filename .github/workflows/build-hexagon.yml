@@ -437,6 +437,35 @@ jobs:
           cd build
           make -j$(nproc)
 
+      # 用与主构建相同的 NDK clang++ 手工编译 llama.cpp 的 test-backend-ops，
+      # 链接主构建产出的 libggml*.so（libggml-htp-v81.so 运行时由 dlopen 加载，无需链接）
+      - name: Build test-backend-ops (llama.cpp 算子正确性测试)
+        run: |
+          set -e
+          set -x
+          echo "=== 检查 test-backend-ops 源码 ==="
+          SRC=/tmp/llama/tests/test-backend-ops.cpp
+          ls -la "$SRC"
+          # 与主构建一致：NDK r28 aarch64-linux-android clang++，arm64-v8a，最高 API level
+          CXX=$(ls ${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang++ | sort -V | tail -n 1)
+          echo "=== 使用编译器: $CXX ==="
+          "$CXX" --version
+          echo "=== 主构建产出的 ggml 库 ==="
+          find build -name "libggml*.so*" | sort
+          # 链接主构建全部 libggml*.so（含 libggml-hexagon.so；htp-v81 由 dlopen 加载）
+          GGML_LIBS=$(find build -name "libggml*.so" | sort | tr '\n' ' ')
+          echo "=== 链接库: $GGML_LIBS ==="
+          mkdir -p pkg
+          "$CXX" -std=c++17 -O2 -fPIC -pthread \
+            -I/tmp/llama/ggml/include \
+            -I/tmp/llama/ggml/src \
+            "$SRC" \
+            $GGML_LIBS \
+            -Wl,-rpath,'$ORIGIN' \
+            -o pkg/test-backend-ops
+          echo "=== test-backend-ops 构建完成 ==="
+          ls -la pkg/test-backend-ops
+
       - name: 打包编译产物
         run: |
           mkdir -p pkg
