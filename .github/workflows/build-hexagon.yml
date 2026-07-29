@@ -19,6 +19,7 @@ on:
           - kernelfix
           - krowbcast
           - flushfix
+          - flushfix2
         default: 'kernelfix'
         required: true
 
@@ -103,6 +104,24 @@ jobs:
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
           
+          if mode == "flushfix2":
+              # 轻量变体：每个 op 前整片 L2 刷一次（比逐张量 flush 便宜），绕过 dirty 跟踪
+              tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
+              tsrc = open(tpath).read()
+
+              t_old = ("void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {\n"
+                       "    const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];")
+              t_new = ("void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {\n"
+                       "    flush_all_dcache(ctx); // SM8850 v81 fix: full L2 flush per op, bypass dirty tracking\n"
+                       "    const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];")
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: flushfix2 anchor not found in htp-tensor.c, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: flushfix2 applied to htp-tensor.c")
+              raise SystemExit(0)
+
           if mode == "flushfix":
               # 修缓存层：对所有 compute 输入无条件 flush，绕过 dirty 区间跟踪（htp/htp-tensor.c）
               tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
