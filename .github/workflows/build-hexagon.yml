@@ -8,7 +8,7 @@ on:
         default: 'master'
         required: true
       patch_mode:
-        description: 'ADD 算子补丁：none/broadcast已验证, bcast_only=只拦广播, noncontig_only=只拦非连续'
+        description: 'ADD 补丁：broadcast=图级回退(已验证), kernelfix=修kernel让广播走正确路径(试验)'
         type: choice
         options:
           - none
@@ -16,7 +16,8 @@ on:
           - broadcast
           - bcast_only
           - noncontig_only
-        default: 'broadcast'
+          - kernelfix
+        default: 'kernelfix'
         required: true
 
 # 显式赋予创建 Release 的写入权限
@@ -176,6 +177,37 @@ jobs:
                       }
                       break;"""
 
+          if mode == "kernelfix":
+              # 修 kernel：收紧 same_shape 判定 + 禁用 row_bcast 快路径，
+              # 让所有广播 ADD 统一走 complex 正确路径（htp/binary-ops.c）
+              kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
+              ksrc = open(kpath).read()
+
+              k_old = """      bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
+                     (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&
+                     (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&
+                     (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&
+                     (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);
+
+          bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);"""
+
+              k_new = """      // SM8850 v81 fix: same_shape 要求4维全等（原 dim 广播分支 DMA 越界读 src1）
+      bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&
+                     (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&
+                     (src1->ne[1] == src0->ne[1]) &&
+                     (src1->ne[2] == src0->ne[2]) &&
+                     (src1->ne[3] == src0->ne[3]);
+
+          // SM8850 v81 fix: 禁用 row_bcast 快路径，广播 ADD 统一走 complex 正确路径
+          bool is_row_bcast = false;"""
+
+              if ksrc.count(k_old) != 1:
+                  print("❌ kernel 补丁锚点未找到（binary-ops.c 已变动），中止构建！")
+                  raise SystemExit(1)
+              open(kpath, "w").write(ksrc.replace(k_old, k_new))
+              print("✅ 已打入 kernelfix 补丁（binary-ops.c）")
+              raise SystemExit(0)
+
           new = {"fp16": fp16_new, "broadcast": bcast_new,
                  "bcast_only": bcast_only_new, "noncontig_only": noncontig_only_new}[mode]
 
@@ -240,7 +272,7 @@ jobs:
             - 用 llama.cpp 最新 ggml-hexagon 整体覆盖（whisper.cpp 自带版停在 7-10）
             - 新增：L2 缓存一致性重做（dirty bit 跟踪 + 延迟刷写）
             - 新增：hmx-queue 修复、MUL_MAT / FLASH_ATTN 管线优化
-            - 新增：WHISPER_BUILD_TESTS / GGML_BUILD_TESTS=ON，产物含 test-backend-ops
+            - 新增：WHISPER_BUILD_TESTS=ON，产物含 test-vad 等测试程序
             - patch_mode=${{ inputs.patch_mode }}（none=无补丁 / fp16=非fp32 ADD回退CPU / broadcast=广播ADD回退CPU）
 
             ## Termux 使用
