@@ -22,6 +22,7 @@ on:
           - flushfix2
           - prof
           - hmxfix
+          - hmxdbg
         default: 'kernelfix'
         required: true
 
@@ -120,6 +121,32 @@ jobs:
                   raise SystemExit(1)
               open(tpath, "w").write(tsrc.replace(t_old, t_new))
               print("OK: hmxfix applied to ggml-hexagon.cpp")
+              raise SystemExit(0)
+
+          if mode == "hmxdbg":
+              # hmxfix + 诊断日志：打印每个 matmul 的 M/批处理/类型/资格判定
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < HTP_MM_HMX_MIN_NROWS) { // SM8850 v81: allow M=4 on HMX"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxdbg anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              t_old2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
+                        "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n")
+              t_new2 = ("    // Check HMX eligibility and try precomputing HMX parameters\n"
+                        "    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);\n"
+                        "    GGML_LOG_INFO(\"ggml-hex: hmxdbg ne00 %d ne01 %d ne10 %d ne11 %d ne12 %d m %d batched %d wtype %d elig %d\\n\", (int) src0->ne[0], (int) src0->ne[1], (int) src1->ne[0], ne11, ne12, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched));\n")
+              if tsrc.count(t_old2) != 1:
+                  print("ERROR: hmxdbg anchor2 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: hmxdbg applied to ggml-hexagon.cpp (2 anchors)")
               raise SystemExit(0)
 
           if mode == "prof":
