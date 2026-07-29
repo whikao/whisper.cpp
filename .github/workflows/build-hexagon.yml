@@ -24,6 +24,7 @@ on:
           - hmxfix
           - hmxdbg
           - hmxfix2
+          - hmxdbg2
         default: 'kernelfix'
         required: true
 
@@ -148,6 +149,43 @@ jobs:
 
               open(tpath, "w").write(tsrc)
               print("OK: hmxdbg applied to ggml-hexagon.cpp (2 anchors)")
+              raise SystemExit(0)
+
+          if mode == "hmxdbg2":
+              # hmxfix2(门槛全放) + 打印 elig / preok / kernel_type，定位 HMX 回退原因
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old1 = "    if (m <= HTP_MM_HMX_MIN_NROWS) {"
+              t_new1 = "    if (m < 1) { // SM8850 v81: HMX for any M (decode M=3)"
+              if tsrc.count(t_old1) != 1:
+                  print("ERROR: hmxdbg2 anchor1 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old1, t_new1)
+
+              t_old2 = ("    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {\n"
+                        "        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {\n"
+                        "            goto finalize;\n"
+                        "        }\n"
+                        "    }\n")
+              t_new2 = ("    {\n"
+                        "        bool elig = hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched);\n"
+                        "        bool preok = false;\n"
+                        "        if (elig) {\n"
+                        "            preok = ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams);\n"
+                        "        }\n"
+                        "        GGML_LOG_INFO(\"ggml-hex: hmxdbg2 ne00 %d ne01 %d ne11 %d m %d batched %d wtype %d elig %d preok %d vtcm %zu\\n\", (int) src0->ne[0], (int) src0->ne[1], ne11, (is_matmul_id ? ne12 : ne11), (int) is_batched, (int) wtype, (int) elig, (int) preok, vtcm_budget);\n"
+                        "        if (preok) {\n"
+                        "            goto finalize;\n"
+                        "        }\n"
+                        "    }\n")
+              if tsrc.count(t_old2) != 1:
+                  print("ERROR: hmxdbg2 anchor2 not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(t_old2, t_new2)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: hmxdbg2 applied to ggml-hexagon.cpp (2 anchors)")
               raise SystemExit(0)
 
           if mode == "hmxfix2":
