@@ -25,6 +25,7 @@ on:
           - hmxdbg
           - hmxfix2
           - hmxdbg2
+          - q8mm
         default: 'kernelfix'
         required: true
 
@@ -202,6 +203,33 @@ jobs:
                   raise SystemExit(1)
               open(tpath, "w").write(tsrc.replace(t_old, t_new))
               print("OK: hmxfix2 applied to ggml-hexagon.cpp")
+              raise SystemExit(0)
+
+          if mode == "q8mm":
+              # 让 q8_0 等量化权重的 MUL_MAT 在 whisper.cpp 下也能上 NPU。
+              # 背景：supported_mul_mat 要求权重在 "repack buffer" 里，但 whisper.cpp 加载器
+              # 只用默认 hexagon buffer；而默认 buffer 的 set_tensor 本来就会把量化权重
+              # 物理 repack 成 tiled 布局（GGML_TYPE_Q8_0 -> repack_q8_0_tiled），
+              # 所以这个检查只是名义标签问题。等效于 GGML_HEXAGON_HOSTBUF=0 的放宽，
+              # 但不触碰 is_host —— HOSTBUF=0 会导致 CPU 不再接受默认 buft，
+              # 使 f32->f16 展平 CPY（KV cache 写入）无处执行而 GGML_ABORT，本补丁规避之。
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old = ("    if (!opt_hostbuf) {\n"
+                       "        return ggml_backend_buffer_is_hexagon(b);\n"
+                       "    }\n"
+                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
+              t_new = ("    // SM8850 q8mm: whisper.cpp weights live in the default hexagon buffer,\n"
+                       "    // whose set_tensor already repacks quantized types to tiled layout.\n"
+                       "    // Treat any hexagon buffer as repack (HOSTBUF=0 semantics without its is_host side-effects).\n"
+                       "    return ggml_backend_buffer_is_hexagon(b);")
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: q8mm anchor not found in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: q8mm applied to ggml-hexagon.cpp")
               raise SystemExit(0)
 
           if mode == "prof":
