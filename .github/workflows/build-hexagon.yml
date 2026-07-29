@@ -20,6 +20,7 @@ on:
           - krowbcast
           - flushfix
           - flushfix2
+          - prof
         default: 'kernelfix'
         required: true
 
@@ -104,6 +105,22 @@ jobs:
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
           
+          if mode == "prof":
+              # 诊断版：把 profile 逐算子耗时日志从 DEBUG 提为 INFO（release 构建可见）
+              # 运行时配合 GGML_HEXAGON_PROFILE=3（或1）使用
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
+              t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
+
+              if tsrc.count(t_old) != 2:
+                  print("ERROR: prof anchor count != 2 in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: prof applied to ggml-hexagon.cpp (2 log sites)")
+              raise SystemExit(0)
+
           if mode == "flushfix2":
               # 轻量变体：每个 op 前整片 L2 刷一次（比逐张量 flush 便宜），绕过 dirty 跟踪
               tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
