@@ -17,6 +17,7 @@ on:
           - bcast_only
           - noncontig_only
           - kernelfix
+          - krowbcast
         default: 'kernelfix'
         required: true
 
@@ -101,8 +102,8 @@ jobs:
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
           
-          if mode == "kernelfix":
-              # 修 kernel：收紧 same_shape 判定 + 禁用 row_bcast 快路径，广播 ADD 走 complex 正确路径
+          if mode in ("kernelfix", "krowbcast"):
+              # 修 kernel：收紧 same_shape 判定；kernelfix=禁用row_bcast，krowbcast=保留row_bcast
               kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
               ksrc = open(kpath).read()
           
@@ -126,11 +127,25 @@ jobs:
                   "    // SM8850 v81 fix: disable row_bcast fast path; broadcast ADD goes to complex path\n"
                   "    bool is_row_bcast = false;")
           
+              k_new_rb = (
+                  "    // SM8850 v81 fix: same_shape requires full 4-dim equality (dim-broadcast DMA read OOB)\n"
+                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == src0->ne[1]) &&\n"
+                  "               (src1->ne[2] == src0->ne[2]) &&\n"
+                  "               (src1->ne[3] == src0->ne[3]);\n"
+                  "\n"
+                  "    // SM8850 v81 fix: row_bcast kept, defined independently of same_shape\n"
+                  "    bool is_row_bcast = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);")
+
+              k_use = k_new if mode == "kernelfix" else k_new_rb
               if ksrc.count(k_old) != 1:
                   print("ERROR: kernel patch anchor not found in binary-ops.c, abort!")
                   raise SystemExit(1)
-              open(kpath, "w").write(ksrc.replace(k_old, k_new))
-              print("OK: kernelfix applied to binary-ops.c")
+              open(kpath, "w").write(ksrc.replace(k_old, k_use))
+              print("OK: %s applied to binary-ops.c" % mode)
               raise SystemExit(0)
           
           path = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
