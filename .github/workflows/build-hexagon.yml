@@ -8,13 +8,15 @@ on:
         default: 'master'
         required: true
       patch_mode:
-        description: 'ADD 算子补丁：none=不打补丁, fp16=非fp32回退CPU, broadcast=广播/非连续回退CPU'
+        description: 'ADD 算子补丁：none/broadcast已验证, bcast_only=只拦广播, noncontig_only=只拦非连续'
         type: choice
         options:
           - none
           - fp16
           - broadcast
-        default: 'none'
+          - bcast_only
+          - noncontig_only
+        default: 'broadcast'
         required: true
 
 # 显式赋予创建 Release 的写入权限
@@ -142,7 +144,40 @@ jobs:
                       }
                       break;"""
 
-          new = fp16_new if mode == "fp16" else bcast_new
+          bcast_only_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: broadcast ADD broken on HTP, fall back to CPU
+                      if (supp && (op->src[0]->ne[0] != op->src[1]->ne[0] ||
+                                   op->src[0]->ne[1] != op->src[1]->ne[1] ||
+                                   op->src[0]->ne[2] != op->src[1]->ne[2] ||
+                                   op->src[0]->ne[3] != op->src[1]->ne[3])) {
+                          supp = false;
+                      }
+                      break;"""
+
+          noncontig_only_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: non-contiguous ADD broken on HTP, fall back to CPU
+                      if (supp && (!ggml_is_contiguous(op->src[0]) ||
+                                   !ggml_is_contiguous(op->src[1]))) {
+                          supp = false;
+                      }
+                      break;"""
+
+          new = {"fp16": fp16_new, "broadcast": bcast_new,
+                 "bcast_only": bcast_only_new, "noncontig_only": noncontig_only_new}[mode]
 
           if src.count(old) != 1:
               print("❌ 补丁锚点未找到（llama.cpp 上游代码可能已变动），中止构建，避免白编！")
@@ -167,6 +202,7 @@ jobs:
             -DHEXAGON_TOOLS_ROOT=${{ env.HEXAGON_TOOLS_ROOT }} \
             -DHTP_ARCH_VERSION=v81 \
             -DWHISPER_BUILD_TESTS=ON \
+            -DGGML_BUILD_TESTS=ON \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: 开始多线程编译
