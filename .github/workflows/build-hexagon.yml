@@ -27,6 +27,7 @@ on:
           - hmxdbg2
           - q8mm5
           - geluenc
+          - geludump
         default: 'kernelfix'
         required: true
 
@@ -401,7 +402,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc"):
+          if mode in ("q8mm5", "geluenc", "geludump"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -606,6 +607,70 @@ jobs:
                       print("ERROR: geluenc anchor-W8 (encode compute unsetenv) not found, abort!")
                       raise SystemExit(1)
                   wsrc = wsrc.replace(g8_old, g8_new)
+
+                  open(wpath, "w").write(wsrc)
+
+              # 9) 仅 geludump:whisper.cpp 给每个 sched 挂 eval callback,
+              # 每个 GELU 节点计算前把输入 tensor 拉回 CPU 打印 min/max/mean/std。
+              # 环境变量 GGML_HEXAGON_GELUDUMP=1 门控,前 300 次后停止打印。
+              if mode == "geludump":
+                  wpath = "src/whisper.cpp"
+                  wsrc = open(wpath).read()
+
+                  d0_old = "// measure the memory usage of a graph and prepare the allocr's internal data buffer"
+                  d0_new = ("// SM8850 geludump: log GELU input tensor stats (env GGML_HEXAGON_GELUDUMP=1)\n"
+                            "static bool whisper_geludump_cb(struct ggml_tensor * t, bool ask, void * user_data) {\n"
+                            "    (void) user_data;\n"
+                            "    if (!ask) {\n"
+                            "        return true;\n"
+                            "    }\n"
+                            "    if (t->op != GGML_OP_UNARY || ggml_get_unary_op(t) != GGML_UNARY_OP_GELU) {\n"
+                            "        return true;\n"
+                            "    }\n"
+                            "    static int g_geludump_n = 0;\n"
+                            "    if (g_geludump_n >= 300) {\n"
+                            "        return true;\n"
+                            "    }\n"
+                            "    g_geludump_n++;\n"
+                            "    struct ggml_tensor * src = t->src[0];\n"
+                            "    if (!src || src->type != GGML_TYPE_F32) {\n"
+                            "        fprintf(stderr, \"geludump #%d: skip (src type %d)\\n\", g_geludump_n, src ? (int) src->type : -1);\n"
+                            "        return true;\n"
+                            "    }\n"
+                            "    std::vector<float> buf(ggml_nelements(src));\n"
+                            "    ggml_backend_tensor_get(src, buf.data(), 0, buf.size() * sizeof(float));\n"
+                            "    double mn = 1e30, mx = -1e30, sum = 0.0, sum2 = 0.0;\n"
+                            "    for (size_t i = 0; i < buf.size(); i++) {\n"
+                            "        float v = buf[i];\n"
+                            "        if (v < mn) mn = v;\n"
+                            "        if (v > mx) mx = v;\n"
+                            "        sum  += v;\n"
+                            "        sum2 += (double) v * v;\n"
+                            "    }\n"
+                            "    double mean = sum / buf.size();\n"
+                            "    double var  = sum2 / buf.size() - mean * mean;\n"
+                            "    fprintf(stderr, \"geludump #%d: ne %lld x %lld  min %9.3f max %9.3f mean %8.4f std %8.4f\\n\",\n"
+                            "            g_geludump_n, (long long) src->ne[0], (long long) src->ne[1], mn, mx, mean, var > 0 ? sqrt(var) : 0.0);\n"
+                            "    return true;\n"
+                            "}\n"
+                            "\n"
+                            "// measure the memory usage of a graph and prepare the allocr's internal data buffer")
+                  if wsrc.count(d0_old) != 1:
+                      print("ERROR: geludump anchor-D0 (sched_graph_init comment) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(d0_old, d0_new)
+
+                  d1_old = "    sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), WHISPER_MAX_NODES, false, true);"
+                  d1_new = (d1_old + "\n"
+                            "\n"
+                            "    // SM8850 geludump\n"
+                            "    if (getenv(\"GGML_HEXAGON_GELUDUMP\")) {\n"
+                            "        ggml_backend_sched_set_eval_callback(sched, whisper_geludump_cb, nullptr);\n"
+                            "    }")
+                  if wsrc.count(d1_old) != 1:
+                      print("ERROR: geludump anchor-D1 (sched_new) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(d1_old, d1_new)
 
                   open(wpath, "w").write(wsrc)
 
