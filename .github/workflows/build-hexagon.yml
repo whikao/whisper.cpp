@@ -28,7 +28,6 @@ on:
           - q8mm5
           - q8mm6
           - q8dbg
-          - encsplit
           - deccpu
         default: 'kernelfix'
         required: true
@@ -404,7 +403,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "encsplit", "deccpu"):
+          if mode in ("q8mm5", "deccpu"):
               # 【真正的总根源修复】whisper.cpp 加载模型时，因 hexagon 默认 buffer
               # is_host=true，直接 fread 进显存（whisper.cpp:1924），完全绕过 set_tensor
               # —— tiled repack 从未发生！DSP 内核按 tiled 布局读原始 q8 数据 = 全垃圾。
@@ -495,24 +494,6 @@ jobs:
                   raise SystemExit(1)
               tsrc = tsrc.replace(h_old, h_new)
 
-              # 4) 仅 encsplit：supported_mul_mat 入口拒收小 m 矩阵乘。
-              # turbo 专用：NPU 跑 turbo 解码图必乱码（v3 同路径正常，纯CPU/Vulkan 均正常，
-              # 文件 sha256 已验证），而 turbo decoder 仅 4 层，CPU decode 实测 4.48ms/轮。
-              # encoder 激活 m=1500 >= 64 留在 NPU；decoder 步进 m=1~4 落 CPU。
-              # 注意：此模式会让 v3 decode 也变慢（落 CPU），是 turbo 专用包。
-              if mode == "encsplit":
-                  s_old = "static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {"
-                  s_new = (s_old + "\n"
-                           "    // SM8850 encsplit: force small-m (decode-step) matmuls to CPU;\n"
-                           "    // hexagon NPU corrupts the turbo decoder graph.\n"
-                           "    if (dst->src[1]->ne[1] < 64) {\n"
-                           "        return false;\n"
-                           "    }\n")
-                  if tsrc.count(s_old) != 1:
-                      print("ERROR: encsplit anchor-4 (supported_mul_mat entry) not found, abort!")
-                      raise SystemExit(1)
-                  tsrc = tsrc.replace(s_old, s_new)
-
               # 5) 仅 deccpu：hexagon supports_op 总闸。whisper.cpp 在 decoder 图
               # 分配/计算期间 setenv GGML_HEXAGON_CPU_ONLY，此期间 NPU 拒绝一切算子，
               # 整个 decoder 图经 sched 回退机制落 CPU（v3 已验证该机制）。
@@ -536,12 +517,62 @@ jobs:
 
               open(tpath, "w").write(tsrc)
 
-              # 6) 仅 deccpu：whisper.cpp 四处注入 setenv/unsetenv
-              # （init 期 decode 图分配 + 运行期 decode 图分配与计算；
-              #  init 期必须生效，否则 CPU compute buffer 不会分配）
+              # 6) 仅 deccpu：whisper.cpp 注入 setenv/unsetenv，覆盖 cross + decode
+              # 两类图的 init 期分配与运行期计算（init 期必须生效，否则 CPU
+              # compute buffer 不会分配）。v2：deccpu 首测 decoder 落 CPU 后输出
+              # 语义连贯但内容错 → decoder 本身没问题，污染源在上游 cross/encoder，
+              # 故 cross 也拉下 CPU，仅 encoder/conv 留 NPU（turbo 专用包）。
               if mode == "deccpu":
                   wpath = "src/whisper.cpp"
                   wsrc = open(wpath).read()
+
+                  w5_old = "        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends,"
+                  w5_new = ("        setenv(\"GGML_HEXAGON_CPU_ONLY\", \"1\", 1);  // SM8850 deccpu\n" + w5_old)
+                  if wsrc.count(w5_old) != 1:
+                      print("ERROR: deccpu anchor-W5 (cross sched init) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(w5_old, w5_new)
+
+                  w6_old = ("                });\n"
+                            "\n"
+                            "        if (!ok) {\n"
+                            "            WHISPER_LOG_ERROR(\"%s: failed to init cross allocator\\n\", __func__);")
+                  w6_new = ("                });\n"
+                            "        unsetenv(\"GGML_HEXAGON_CPU_ONLY\");  // SM8850 deccpu\n"
+                            "\n"
+                            "        if (!ok) {\n"
+                            "            WHISPER_LOG_ERROR(\"%s: failed to init cross allocator\\n\", __func__);")
+                  if wsrc.count(w6_old) != 1:
+                      print("ERROR: deccpu anchor-W6 (cross init unsetenv) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(w6_old, w6_new)
+
+                  w7_old = "        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);\n"
+                  w7_new = (w7_old + "\n"
+                            "        setenv(\"GGML_HEXAGON_CPU_ONLY\", \"1\", 1);  // SM8850 deccpu\n")
+                  if wsrc.count(w7_old) != 1:
+                      print("ERROR: deccpu anchor-W7 (cross compute setenv) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(w7_old, w7_new)
+
+                  w8_old = ("        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
+                            "            return false;\n"
+                            "        }\n"
+                            "    }\n"
+                            "\n"
+                            "    wstate.t_encode_us += ggml_time_us() - t_start_us;")
+                  w8_new = ("        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
+                            "            unsetenv(\"GGML_HEXAGON_CPU_ONLY\");\n"
+                            "            return false;\n"
+                            "        }\n"
+                            "        unsetenv(\"GGML_HEXAGON_CPU_ONLY\");  // SM8850 deccpu\n"
+                            "    }\n"
+                            "\n"
+                            "    wstate.t_encode_us += ggml_time_us() - t_start_us;")
+                  if wsrc.count(w8_old) != 1:
+                      print("ERROR: deccpu anchor-W8 (cross compute unsetenv) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(w8_old, w8_new)
 
                   w1_old = "        bool ok = whisper_sched_graph_init(state->sched_decode, state->backends,"
                   w1_new = ("        // SM8850 deccpu: decoder graph goes to CPU (hexagon corrupts turbo decode)\n"
