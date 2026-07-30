@@ -26,8 +26,7 @@ on:
           - hmxfix2
           - hmxdbg2
           - q8mm5
-          - q8dbg
-          - deccpu
+          - geluenc
         default: 'kernelfix'
         required: true
 
@@ -402,13 +401,10 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "deccpu"):
-              # 【真正的总根源修复】whisper.cpp 加载模型时，因 hexagon 默认 buffer
-              # is_host=true，直接 fread 进显存（whisper.cpp:1924），完全绕过 set_tensor
-              # —— tiled repack 从未发生！DSP 内核按 tiled 布局读原始 q8 数据 = 全垃圾。
-              # 这解释：fp16 正常 / q8 三内核变体全错 / 单元测试全对 / set_tensor 守卫无效。
-              # 修复：supported_mul_mat 接受某量化权重时，就地懒 repack（首次见到才做，
-              # 指针集合记录）。ne[1]>32768 的 lm-head 在 hook 之前已被拒绝，保持原始布局。
+          if mode in ("q8mm5", "geluenc"):
+              # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
+              # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
+              # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
               tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
               tsrc = open(tpath).read()
 
@@ -493,201 +489,127 @@ jobs:
                   raise SystemExit(1)
               tsrc = tsrc.replace(h_old, h_new)
 
-              # 5) 仅 deccpu：hexagon supports_op 总闸。whisper.cpp 在 decoder 图
-              # 分配/计算期间 setenv GGML_HEXAGON_CPU_ONLY，此期间 NPU 拒绝一切算子，
-              # 整个 decoder 图经 sched 回退机制落 CPU（v3 已验证该机制）。
-              # 背景：turbo 的 decoder 图在 NPU 上必坏（q8/fp16 皆然，encsplit 证明
-              # 不是矩阵乘的问题），而 turbo decoder 仅 4 层 CPU 只需 ~5ms/轮。
-              if mode == "deccpu":
-                  gate_old = ("    // reject ops that match the filter\n"
-                              "    if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {\n"
-                              "        return false;\n"
-                              "    }")
-                  gate_new = (gate_old + "\n\n"
-                              "    // SM8850 deccpu: while whisper.cpp runs the decoder graph it sets\n"
-                              "    // GGML_HEXAGON_CPU_ONLY; refuse everything so the graph lands on CPU.\n"
-                              "    if (getenv(\"GGML_HEXAGON_CPU_ONLY\")) {\n"
-                              "        return false;\n"
-                              "    }")
-                  if tsrc.count(gate_old) != 1:
-                      print("ERROR: deccpu anchor-5 (supports_op gate) not found, abort!")
+
+              # 7) 仅 geluenc:只在 conv+encoder 图运行期拒 GELU(HTP 近似 GELU
+              # 在极端激活值下污染 encoder,输出全 ♪);decoder 的 GELU 留 NPU
+              # 全速,运行时不再需要 OPFILTER(全局屏蔽会让 turbo decode 慢 3 倍)。
+              if mode == "geluenc":
+                  gel_old = ("    // reject ops that match the filter\n"
+                             "    if (opt_opfilter && std::regex_match(ggml_op_desc(op), *opt_opfilter)) {\n"
+                             "        return false;\n"
+                             "    }")
+                  gel_new = (gel_old + "\n\n"
+                             "    // SM8850 geluenc: while whisper.cpp runs the conv+encoder graphs it sets\n"
+                             "    // GGML_HEXAGON_GELU_CPU_ONLY; refuse only GELU so it lands on CPU.\n"
+                             "    // The HTP fast-approx GELU kernel corrupts encoder features on\n"
+                             "    // extreme-range activations (turbo always, v3 on loud music).\n"
+                             "    if (op->op == GGML_OP_GELU && getenv(\"GGML_HEXAGON_GELU_CPU_ONLY\")) {\n"
+                             "        return false;\n"
+                             "    }")
+                  if tsrc.count(gel_old) != 1:
+                      print("ERROR: geluenc anchor-7 (supports_op GELU gate) not found, abort!")
                       raise SystemExit(1)
-                  tsrc = tsrc.replace(gate_old, gate_new)
+                  tsrc = tsrc.replace(gel_old, gel_new)
 
               open(tpath, "w").write(tsrc)
 
-              # 6) 仅 deccpu：whisper.cpp 注入 setenv/unsetenv，覆盖 cross + decode
-              # 两类图的 init 期分配与运行期计算（init 期必须生效，否则 CPU
-              # compute buffer 不会分配）。v2：deccpu 首测 decoder 落 CPU 后输出
-              # 语义连贯但内容错 → decoder 本身没问题，污染源在上游 cross/encoder，
-              # 故 cross 也拉下 CPU，仅 encoder/conv 留 NPU（turbo 专用包）。
-              if mode == "deccpu":
+
+              # 8) 仅 geluenc:whisper.cpp 在 conv + encoder 图 init/计算期
+              # 注入 setenv/unsetenv GGML_HEXAGON_GELU_CPU_ONLY。
+              if mode == "geluenc":
                   wpath = "src/whisper.cpp"
                   wsrc = open(wpath).read()
 
-                  w5_old = "        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends,"
-                  w5_new = ("        setenv(\"GGML_HEXAGON_CPU_ONLY\", \"1\", 1);  // SM8850 deccpu\n" + w5_old)
-                  if wsrc.count(w5_old) != 1:
-                      print("ERROR: deccpu anchor-W5 (cross sched init) not found, abort!")
+                  g1_old = "        bool ok = whisper_sched_graph_init(state->sched_conv, state->backends,"
+                  g1_new = ("        setenv(\"GGML_HEXAGON_GELU_CPU_ONLY\", \"1\", 1);  // SM8850 geluenc\n" + g1_old)
+                  if wsrc.count(g1_old) != 1:
+                      print("ERROR: geluenc anchor-W1 (conv sched init) not found, abort!")
                       raise SystemExit(1)
-                  wsrc = wsrc.replace(w5_old, w5_new)
+                  wsrc = wsrc.replace(g1_old, g1_new)
 
-                  w6_old = ("                });\n"
+                  g2_old = ("                });\n"
                             "\n"
                             "        if (!ok) {\n"
-                            "            WHISPER_LOG_ERROR(\"%s: failed to init cross allocator\\n\", __func__);")
-                  w6_new = ("                });\n"
-                            "        unsetenv(\"GGML_HEXAGON_CPU_ONLY\");  // SM8850 deccpu\n"
+                            "            WHISPER_LOG_ERROR(\"%s: failed to init conv allocator\\n\", __func__);")
+                  g2_new = ("                });\n"
+                            "        unsetenv(\"GGML_HEXAGON_GELU_CPU_ONLY\");  // SM8850 geluenc\n"
                             "\n"
                             "        if (!ok) {\n"
-                            "            WHISPER_LOG_ERROR(\"%s: failed to init cross allocator\\n\", __func__);")
-                  if wsrc.count(w6_old) != 1:
-                      print("ERROR: deccpu anchor-W6 (cross init unsetenv) not found, abort!")
+                            "            WHISPER_LOG_ERROR(\"%s: failed to init conv allocator\\n\", __func__);")
+                  if wsrc.count(g2_old) != 1:
+                      print("ERROR: geluenc anchor-W2 (conv init unsetenv) not found, abort!")
                       raise SystemExit(1)
-                  wsrc = wsrc.replace(w6_old, w6_new)
+                  wsrc = wsrc.replace(g2_old, g2_new)
 
-                  w7_old = "        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);\n"
-                  w7_new = (w7_old + "\n"
-                            "        setenv(\"GGML_HEXAGON_CPU_ONLY\", \"1\", 1);  // SM8850 deccpu\n")
-                  if wsrc.count(w7_old) != 1:
-                      print("ERROR: deccpu anchor-W7 (cross compute setenv) not found, abort!")
+                  g3_old = "        ggml_cgraph * gf = whisper_build_graph_conv(wctx, wstate);\n"
+                  g3_new = (g3_old + "\n"
+                            "        setenv(\"GGML_HEXAGON_GELU_CPU_ONLY\", \"1\", 1);  // SM8850 geluenc\n")
+                  if wsrc.count(g3_old) != 1:
+                      print("ERROR: geluenc anchor-W3 (conv compute setenv) not found, abort!")
                       raise SystemExit(1)
-                  wsrc = wsrc.replace(w7_old, w7_new)
+                  wsrc = wsrc.replace(g3_old, g3_new)
 
-                  w8_old = ("        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
+                  g4_old = ("    // encoder\n"
+                            "    if (!whisper_encode_external(wstate)) {")
+                  g4_new = ("    unsetenv(\"GGML_HEXAGON_GELU_CPU_ONLY\");  // SM8850 geluenc\n"
+                            "\n" + g4_old)
+                  if wsrc.count(g4_old) != 1:
+                      print("ERROR: geluenc anchor-W4 (conv compute unsetenv) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(g4_old, g4_new)
+
+                  g5_old = "        bool ok = whisper_sched_graph_init(state->sched_encode, state->backends,"
+                  g5_new = ("        setenv(\"GGML_HEXAGON_GELU_CPU_ONLY\", \"1\", 1);  // SM8850 geluenc\n" + g5_old)
+                  if wsrc.count(g5_old) != 1:
+                      print("ERROR: geluenc anchor-W5 (encode sched init) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(g5_old, g5_new)
+
+                  g6_old = ("                });\n"
+                            "\n"
+                            "        if (!ok) {\n"
+                            "            WHISPER_LOG_ERROR(\"%s: failed to init encoder allocator\\n\", __func__);")
+                  g6_new = ("                });\n"
+                            "        unsetenv(\"GGML_HEXAGON_GELU_CPU_ONLY\");  // SM8850 geluenc\n"
+                            "\n"
+                            "        if (!ok) {\n"
+                            "            WHISPER_LOG_ERROR(\"%s: failed to init encoder allocator\\n\", __func__);")
+                  if wsrc.count(g6_old) != 1:
+                      print("ERROR: geluenc anchor-W6 (encode init unsetenv) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(g6_old, g6_new)
+
+                  g7_old = "        ggml_cgraph * gf = whisper_build_graph_encoder(wctx, wstate);\n"
+                  g7_new = (g7_old + "\n"
+                            "        setenv(\"GGML_HEXAGON_GELU_CPU_ONLY\", \"1\", 1);  // SM8850 geluenc\n")
+                  if wsrc.count(g7_old) != 1:
+                      print("ERROR: geluenc anchor-W7 (encode compute setenv) not found, abort!")
+                      raise SystemExit(1)
+                  wsrc = wsrc.replace(g7_old, g7_new)
+
+                  g8_old = ("        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
                             "            return false;\n"
                             "        }\n"
                             "    }\n"
                             "\n"
-                            "    wstate.t_encode_us += ggml_time_us() - t_start_us;")
-                  w8_new = ("        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
-                            "            unsetenv(\"GGML_HEXAGON_CPU_ONLY\");\n"
+                            "    // cross")
+                  g8_new = ("        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
                             "            return false;\n"
                             "        }\n"
-                            "        unsetenv(\"GGML_HEXAGON_CPU_ONLY\");  // SM8850 deccpu\n"
+                            "        unsetenv(\"GGML_HEXAGON_GELU_CPU_ONLY\");  // SM8850 geluenc\n"
                             "    }\n"
                             "\n"
-                            "    wstate.t_encode_us += ggml_time_us() - t_start_us;")
-                  if wsrc.count(w8_old) != 1:
-                      print("ERROR: deccpu anchor-W8 (cross compute unsetenv) not found, abort!")
+                            "    // cross")
+                  if wsrc.count(g8_old) != 1:
+                      print("ERROR: geluenc anchor-W8 (encode compute unsetenv) not found, abort!")
                       raise SystemExit(1)
-                  wsrc = wsrc.replace(w8_old, w8_new)
-
-                  w1_old = "        bool ok = whisper_sched_graph_init(state->sched_decode, state->backends,"
-                  w1_new = ("        // SM8850 deccpu: decoder graph goes to CPU (hexagon corrupts turbo decode)\n"
-                            "        setenv(\"GGML_HEXAGON_CPU_ONLY\", \"1\", 1);\n" + w1_old)
-                  if wsrc.count(w1_old) != 1:
-                      print("ERROR: deccpu anchor-W1 (decode sched init) not found, abort!")
-                      raise SystemExit(1)
-                  wsrc = wsrc.replace(w1_old, w1_new)
-
-                  w2_old = ("                });\n"
-                            "\n"
-                            "        if (!ok) {\n"
-                            "            WHISPER_LOG_ERROR(\"%s: failed to init decoder allocator\\n\", __func__);")
-                  w2_new = ("                });\n"
-                            "        unsetenv(\"GGML_HEXAGON_CPU_ONLY\");  // SM8850 deccpu\n"
-                            "\n"
-                            "        if (!ok) {\n"
-                            "            WHISPER_LOG_ERROR(\"%s: failed to init decoder allocator\\n\", __func__);")
-                  if wsrc.count(w2_old) != 1:
-                      print("ERROR: deccpu anchor-W2 (decode init unsetenv) not found, abort!")
-                      raise SystemExit(1)
-                  wsrc = wsrc.replace(w2_old, w2_new)
-
-                  w3_old = "        ggml_cgraph * gf = whisper_build_graph_decoder(wctx, wstate, batch, save_alignment_heads_QKs, false);\n"
-                  w3_new = (w3_old + "\n"
-                            "        setenv(\"GGML_HEXAGON_CPU_ONLY\", \"1\", 1);  // SM8850 deccpu\n")
-                  if wsrc.count(w3_old) != 1:
-                      print("ERROR: deccpu anchor-W3 (decode compute setenv) not found, abort!")
-                      raise SystemExit(1)
-                  wsrc = wsrc.replace(w3_old, w3_new)
-
-                  w4_old = ("        logits = ggml_graph_node(gf, -1);\n"
-                            "\n"
-                            "        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
-                            "            return false;\n"
-                            "        }\n"
-                            "    }")
-                  w4_new = ("        logits = ggml_graph_node(gf, -1);\n"
-                            "\n"
-                            "        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {\n"
-                            "            unsetenv(\"GGML_HEXAGON_CPU_ONLY\");\n"
-                            "            return false;\n"
-                            "        }\n"
-                            "        unsetenv(\"GGML_HEXAGON_CPU_ONLY\");  // SM8850 deccpu\n"
-                            "    }")
-                  if wsrc.count(w4_old) != 1:
-                      print("ERROR: deccpu anchor-W4 (decode compute unsetenv) not found, abort!")
-                      raise SystemExit(1)
-                  wsrc = wsrc.replace(w4_old, w4_new)
+                  wsrc = wsrc.replace(g8_old, g8_new)
 
                   open(wpath, "w").write(wsrc)
 
               print("OK: " + mode + " applied")
               raise SystemExit(0)
 
-
-          if mode == "q8dbg":
-              # q8mm2 全部修改 + 把 dump_op_supp 的日志从 DEBUG 提为 INFO，
-              # 使 GGML_HEXAGON_VERBOSE=1 下可见每个算子的支持判定（名字/维度/类型/yes-no），
-              # 用于定位剩余回退算子。
-              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-              tsrc = open(tpath).read()
-
-              # 1) 同 q8mm
-              q_old = ("    if (!opt_hostbuf) {\n"
-                       "        return ggml_backend_buffer_is_hexagon(b);\n"
-                       "    }\n"
-                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
-              q_new = ("    // SM8850 q8mm2: treat any hexagon buffer as repack\n"
-                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
-                       "    return ggml_backend_buffer_is_hexagon(b);")
-              if tsrc.count(q_old) != 1:
-                  print("ERROR: q8dbg anchor-1 (is_hexagon_repack) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(q_old, q_new)
-
-              # 2) set_tensor 守卫
-              s_old = ('    HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
-              s_new = (s_old +
-                       "\n"
-                       "    // SM8850 q8mm2: tensors with ne[1] > 32768 are always refused by\n"
-                       "    // supported_mul_mat and run on CPU, so keep their original (non-tiled) layout.\n"
-                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
-                       "        memcpy((char *) tensor->data + offset, data, size);\n"
-                       "        return;\n"
-                       "    }\n")
-              if tsrc.count(s_old) != 1:
-                  print("ERROR: q8dbg anchor-2 (set_tensor) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(s_old, s_new)
-
-              # 3) get_tensor 守卫
-              g_old = ('    HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
-              g_new = (g_old +
-                       "\n"
-                       "    // SM8850 q8mm2: mirror of set_tensor guard for CPU-fallback weights.\n"
-                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
-                       "        memcpy(data, (const char *) tensor->data + offset, size);\n"
-                       "        return;\n"
-                       "    }\n")
-              if tsrc.count(g_old) != 1:
-                  print("ERROR: q8dbg anchor-3 (get_tensor) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(g_old, g_new)
-
-              # 4) dump_op_supp 提为 INFO
-              d_old = 'GGML_LOG_DEBUG("ggml-hex: %s supports-op %s|%s|%s|%s|%s|%s|%s\\n"'
-              d_new = 'GGML_LOG_INFO("ggml-hex: %s supports-op %s|%s|%s|%s|%s|%s|%s\\n"'
-              if tsrc.count(d_old) != 1:
-                  print("ERROR: q8dbg anchor-4 (dump_op_supp) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(d_old, d_new)
-
-              open(tpath, "w").write(tsrc)
-              print("OK: q8dbg applied to ggml-hexagon.cpp (4 sites)")
-              raise SystemExit(0)
 
           print("patch_mode=" + mode + " 不在本 step（B），跳过")
           EOF
