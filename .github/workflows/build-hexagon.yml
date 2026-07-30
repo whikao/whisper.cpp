@@ -27,6 +27,7 @@ on:
           - hmxdbg2
           - q8mm
           - q8mm2
+          - q8dbg
         default: 'kernelfix'
         required: true
 
@@ -288,6 +289,67 @@ jobs:
 
               open(tpath, "w").write(tsrc)
               print("OK: q8mm2 applied to ggml-hexagon.cpp (3 sites)")
+              raise SystemExit(0)
+
+          if mode == "q8dbg":
+              # q8mm2 全部修改 + 把 dump_op_supp 的日志从 DEBUG 提为 INFO，
+              # 使 GGML_HEXAGON_VERBOSE=1 下可见每个算子的支持判定（名字/维度/类型/yes-no），
+              # 用于定位剩余回退算子。
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              # 1) 同 q8mm
+              q_old = ("    if (!opt_hostbuf) {\n"
+                       "        return ggml_backend_buffer_is_hexagon(b);\n"
+                       "    }\n"
+                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
+              q_new = ("    // SM8850 q8mm2: treat any hexagon buffer as repack\n"
+                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
+                       "    return ggml_backend_buffer_is_hexagon(b);")
+              if tsrc.count(q_old) != 1:
+                  print("ERROR: q8dbg anchor-1 (is_hexagon_repack) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(q_old, q_new)
+
+              # 2) set_tensor 守卫
+              s_old = ('    HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
+              s_new = (s_old +
+                       "\n"
+                       "    // SM8850 q8mm2: tensors with ne[1] > 32768 are always refused by\n"
+                       "    // supported_mul_mat and run on CPU, so keep their original (non-tiled) layout.\n"
+                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
+                       "        memcpy((char *) tensor->data + offset, data, size);\n"
+                       "        return;\n"
+                       "    }\n")
+              if tsrc.count(s_old) != 1:
+                  print("ERROR: q8dbg anchor-2 (set_tensor) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(s_old, s_new)
+
+              # 3) get_tensor 守卫
+              g_old = ('    HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
+              g_new = (g_old +
+                       "\n"
+                       "    // SM8850 q8mm2: mirror of set_tensor guard for CPU-fallback weights.\n"
+                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
+                       "        memcpy(data, (const char *) tensor->data + offset, size);\n"
+                       "        return;\n"
+                       "    }\n")
+              if tsrc.count(g_old) != 1:
+                  print("ERROR: q8dbg anchor-3 (get_tensor) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(g_old, g_new)
+
+              # 4) dump_op_supp 提为 INFO
+              d_old = 'GGML_LOG_DEBUG("ggml-hex: %s supports-op %s|%s|%s|%s|%s|%s|%s\\n"'
+              d_new = 'GGML_LOG_INFO("ggml-hex: %s supports-op %s|%s|%s|%s|%s|%s|%s\\n"'
+              if tsrc.count(d_old) != 1:
+                  print("ERROR: q8dbg anchor-4 (dump_op_supp) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(d_old, d_new)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: q8dbg applied to ggml-hexagon.cpp (4 sites)")
               raise SystemExit(0)
 
           if mode == "prof":
