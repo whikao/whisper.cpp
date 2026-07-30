@@ -27,6 +27,7 @@ on:
           - hmxdbg2
           - q8mm
           - q8mm2
+          - q8mm3
           - q8dbg
         default: 'kernelfix'
         required: true
@@ -289,6 +290,91 @@ jobs:
 
               open(tpath, "w").write(tsrc)
               print("OK: q8mm2 applied to ggml-hexagon.cpp (3 sites)")
+              raise SystemExit(0)
+
+          if mode == "q8mm3":
+              # 二分隔离版：在 q8mm2 基础上，把 ENCODER 的量化矩阵乘隔离到 CPU。
+              # 背景：fp16 全正常 + 三种 q8 内核变体在真实图里全错（但单元测试全对），
+              # 且 bs=1 时 decode 能跑 219 步却只吐时间戳 token —— 典型「encoder 输出是垃圾」症状。
+              # 做法：set/get_tensor 对名字以 "encoder." 开头的量化权重保持原始布局，
+              # 同时 supported_mul_mat 拒绝 encoder 量化矩阵乘 -> CPU 回退读原始数据（正确）。
+              # decoder 仍在 NPU。若输出变正确 -> encoder NPU q8 路径是凶手。
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              # 1) 同 q8mm
+              q_old = ("    if (!opt_hostbuf) {\n"
+                       "        return ggml_backend_buffer_is_hexagon(b);\n"
+                       "    }\n"
+                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
+              q_new = ("    // SM8850 q8mm3: treat any hexagon buffer as repack\n"
+                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
+                       "    return ggml_backend_buffer_is_hexagon(b);")
+              if tsrc.count(q_old) != 1:
+                  print("ERROR: q8mm3 anchor-1 (is_hexagon_repack) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(q_old, q_new)
+
+              # 2) set_tensor：ne[1] > 32768 或 encoder.* 的量化权重保持原始布局
+              s_old = ('    HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
+              s_new = (s_old +
+                       "\n"
+                       "    // SM8850 q8mm3: keep original (non-tiled) layout for quant weights that\n"
+                       "    // will run on CPU: ne[1] > 32768 (always refused) or encoder.* (bisect).\n"
+                       "    if (ggml_hexagon_is_repack_type(tensor->type) &&\n"
+                       "        (tensor->ne[1] > 32768 || strncmp(tensor->name, \"encoder.\", 8) == 0)) {\n"
+                       "        memcpy((char *) tensor->data + offset, data, size);\n"
+                       "        return;\n"
+                       "    }\n")
+              if tsrc.count(s_old) != 1:
+                  print("ERROR: q8mm3 anchor-2 (set_tensor) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(s_old, s_new)
+
+              # 3) get_tensor：对称
+              g_old = ('    HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
+              g_new = (g_old +
+                       "\n"
+                       "    // SM8850 q8mm3: mirror of set_tensor guard.\n"
+                       "    if (ggml_hexagon_is_repack_type(tensor->type) &&\n"
+                       "        (tensor->ne[1] > 32768 || strncmp(tensor->name, \"encoder.\", 8) == 0)) {\n"
+                       "        memcpy(data, (const char *) tensor->data + offset, size);\n"
+                       "        return;\n"
+                       "    }\n")
+              if tsrc.count(g_old) != 1:
+                  print("ERROR: q8mm3 anchor-3 (get_tensor) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(g_old, g_new)
+
+              # 4) supported_mul_mat：拒绝 encoder 量化矩阵乘（踢回 CPU，配合 2 的原始布局）
+              m_old = ("        case GGML_TYPE_Q4_0:\n"
+                       "        case GGML_TYPE_Q4_1:\n"
+                       "        case GGML_TYPE_Q8_0:\n"
+                       "        case GGML_TYPE_IQ4_NL:\n"
+                       "        case GGML_TYPE_MXFP4:\n"
+                       "            if (src0->ne[0] % 32) {\n"
+                       "                return false;\n"
+                       "            }")
+              m_new = ("        case GGML_TYPE_Q4_0:\n"
+                       "        case GGML_TYPE_Q4_1:\n"
+                       "        case GGML_TYPE_Q8_0:\n"
+                       "        case GGML_TYPE_IQ4_NL:\n"
+                       "        case GGML_TYPE_MXFP4:\n"
+                       "            // SM8850 q8mm3 bisect: encoder quant matmuls run on CPU\n"
+                       "            // (weights kept in original layout by set_tensor).\n"
+                       "            if (strncmp(src0->name, \"encoder.\", 8) == 0) {\n"
+                       "                return false;\n"
+                       "            }\n"
+                       "            if (src0->ne[0] % 32) {\n"
+                       "                return false;\n"
+                       "            }")
+              if tsrc.count(m_old) != 1:
+                  print("ERROR: q8mm3 anchor-4 (supported_mul_mat) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(m_old, m_new)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: q8mm3 applied to ggml-hexagon.cpp (4 sites)")
               raise SystemExit(0)
 
           if mode == "q8dbg":
