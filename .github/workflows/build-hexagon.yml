@@ -28,6 +28,7 @@ on:
           - q8mm5
           - q8mm6
           - q8dbg
+          - encsplit
         default: 'kernelfix'
         required: true
 
@@ -402,7 +403,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode == "q8mm5":
+          if mode in ("q8mm5", "encsplit"):
               # 【真正的总根源修复】whisper.cpp 加载模型时，因 hexagon 默认 buffer
               # is_host=true，直接 fread 进显存（whisper.cpp:1924），完全绕过 set_tensor
               # —— tiled repack 从未发生！DSP 内核按 tiled 布局读原始 q8 数据 = 全垃圾。
@@ -493,8 +494,26 @@ jobs:
                   raise SystemExit(1)
               tsrc = tsrc.replace(h_old, h_new)
 
+              # 4) 仅 encsplit：supported_mul_mat 入口拒收小 m 矩阵乘。
+              # turbo 专用：NPU 跑 turbo 解码图必乱码（v3 同路径正常，纯CPU/Vulkan 均正常，
+              # 文件 sha256 已验证），而 turbo decoder 仅 4 层，CPU decode 实测 4.48ms/轮。
+              # encoder 激活 m=1500 >= 64 留在 NPU；decoder 步进 m=1~4 落 CPU。
+              # 注意：此模式会让 v3 decode 也变慢（落 CPU），是 turbo 专用包。
+              if mode == "encsplit":
+                  s_old = "static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {"
+                  s_new = (s_old + "\n"
+                           "    // SM8850 encsplit: force small-m (decode-step) matmuls to CPU;\n"
+                           "    // hexagon NPU corrupts the turbo decoder graph.\n"
+                           "    if (dst->src[1]->ne[1] < 64) {\n"
+                           "        return false;\n"
+                           "    }\n")
+                  if tsrc.count(s_old) != 1:
+                      print("ERROR: encsplit anchor-4 (supported_mul_mat entry) not found, abort!")
+                      raise SystemExit(1)
+                  tsrc = tsrc.replace(s_old, s_new)
+
               open(tpath, "w").write(tsrc)
-              print("OK: q8mm5 applied to ggml-hexagon.cpp (3 sites)")
+              print("OK: " + mode + " applied to ggml-hexagon.cpp")
               raise SystemExit(0)
 
           if mode == "q8mm6":
