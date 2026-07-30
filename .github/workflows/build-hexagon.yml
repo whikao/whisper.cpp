@@ -28,6 +28,7 @@ on:
           - q8mm5
           - geluenc
           - geludump
+          - vdbg
         default: 'kernelfix'
         required: true
 
@@ -112,7 +113,28 @@ jobs:
           if mode == "none":
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
-          
+
+          if mode == "vdbg":
+              # vdbg: 提升 ggml-hexagon 的 GGML_LOG_DEBUG 为 INFO,
+              # 使 GGML_HEXAGON_VERBOSE=2 能打印 execute-op / htp-tensor /
+              # htp-buf / op-queue push 等 per-op 明细(release 编译默认裁剪 DEBUG)。
+              import glob, re
+              nfiles = 0
+              nlines = 0
+              for f in glob.glob("ggml/src/ggml-hexagon/**/*.c*", recursive=True):
+                  s = open(f).read()
+                  n = s.count("GGML_LOG_DEBUG")
+                  if n:
+                      open(f, "w").write(s.replace("GGML_LOG_DEBUG", "GGML_LOG_INFO"))
+                      nfiles += 1
+                      nlines += n
+              print("OK: vdbg promoted GGML_LOG_DEBUG -> GGML_LOG_INFO in %d files (%d sites)" % (nfiles, nlines))
+              if nfiles == 0:
+                  print("ERROR: vdbg found no GGML_LOG_DEBUG sites, abort!")
+                  raise SystemExit(1)
+              print("vdbg 日志提升完成，q8mm5 补丁在 B 组 step 继续")
+              raise SystemExit(0)
+
 
           if mode == "hmxfix":
               # 放宽 HMX 矩阵乘的行数门槛：M=4 (bs3 bo3) 也走 HMX
@@ -402,7 +424,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
