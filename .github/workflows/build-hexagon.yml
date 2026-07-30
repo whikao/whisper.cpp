@@ -25,10 +25,8 @@ on:
           - hmxdbg
           - hmxfix2
           - hmxdbg2
-          - q8mm
-          - q8mm2
-          - q8mm3
           - q8mm5
+          - q8mm6
           - q8dbg
         default: 'kernelfix'
         required: true
@@ -404,175 +402,6 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode == "q8mm":
-              # 让 q8_0 等量化权重的 MUL_MAT 在 whisper.cpp 下也能上 NPU。
-              # 背景：supported_mul_mat 要求权重在 "repack buffer" 里，但 whisper.cpp 加载器
-              # 只用默认 hexagon buffer；而默认 buffer 的 set_tensor 本来就会把量化权重
-              # 物理 repack 成 tiled 布局（GGML_TYPE_Q8_0 -> repack_q8_0_tiled），
-              # 所以这个检查只是名义标签问题。等效于 GGML_HEXAGON_HOSTBUF=0 的放宽，
-              # 但不触碰 is_host —— HOSTBUF=0 会导致 CPU 不再接受默认 buft，
-              # 使 f32->f16 展平 CPY（KV cache 写入）无处执行而 GGML_ABORT，本补丁规避之。
-              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-              tsrc = open(tpath).read()
-
-              t_old = ("    if (!opt_hostbuf) {\n"
-                       "        return ggml_backend_buffer_is_hexagon(b);\n"
-                       "    }\n"
-                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
-              t_new = ("    // SM8850 q8mm: whisper.cpp weights live in the default hexagon buffer,\n"
-                       "    // whose set_tensor already repacks quantized types to tiled layout.\n"
-                       "    // Treat any hexagon buffer as repack (HOSTBUF=0 semantics without its is_host side-effects).\n"
-                       "    return ggml_backend_buffer_is_hexagon(b);")
-
-              if tsrc.count(t_old) != 1:
-                  print("ERROR: q8mm anchor not found in ggml-hexagon.cpp, abort!")
-                  raise SystemExit(1)
-              open(tpath, "w").write(tsrc.replace(t_old, t_new))
-              print("OK: q8mm applied to ggml-hexagon.cpp")
-              raise SystemExit(0)
-
-          if mode == "q8mm2":
-              # q8mm + 修复 q8 输出为空的真凶：
-              # lm-head（输出投影, ne1=51866）被 supported_mul_mat 的 ne[1] > 32768
-              # 硬限制拒绝 -> 回退 CPU -> CPU 把已被 set_tensor tiled-repack 的权重
-              # 当原始 q8 布局读 -> logits 全乱 -> 立即 EOT -> 空字幕。
-              # 修复：set_tensor/get_tensor 对 ne[1] > 32768 的量化 tensor 跳过
-              # repack/untile（保持原始布局）。该条件与 NPU 支持检查完全互斥
-              # （这种 tensor 永远只能走 CPU），无副作用。
-              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-              tsrc = open(tpath).read()
-
-              # 1) 同 q8mm：把任意 hexagon buffer 视为 repack
-              q_old = ("    if (!opt_hostbuf) {\n"
-                       "        return ggml_backend_buffer_is_hexagon(b);\n"
-                       "    }\n"
-                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
-              q_new = ("    // SM8850 q8mm2: treat any hexagon buffer as repack\n"
-                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
-                       "    return ggml_backend_buffer_is_hexagon(b);")
-              if tsrc.count(q_old) != 1:
-                  print("ERROR: q8mm2 anchor-1 (is_hexagon_repack) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(q_old, q_new)
-
-              # 2) set_tensor：ne[1] > 32768 的量化权重保持原始布局
-              s_old = ('    HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
-              s_new = (s_old +
-                       "\n"
-                       "    // SM8850 q8mm2: tensors with ne[1] > 32768 are always refused by\n"
-                       "    // supported_mul_mat and run on CPU, so keep their original (non-tiled) layout.\n"
-                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
-                       "        memcpy((char *) tensor->data + offset, data, size);\n"
-                       "        return;\n"
-                       "    }\n")
-              if tsrc.count(s_old) != 1:
-                  print("ERROR: q8mm2 anchor-2 (set_tensor) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(s_old, s_new)
-
-              # 3) get_tensor：对称地按原始布局读回
-              g_old = ('    HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
-              g_new = (g_old +
-                       "\n"
-                       "    // SM8850 q8mm2: mirror of set_tensor guard for CPU-fallback weights.\n"
-                       "    if (tensor->ne[1] > 32768 && ggml_hexagon_is_repack_type(tensor->type)) {\n"
-                       "        memcpy(data, (const char *) tensor->data + offset, size);\n"
-                       "        return;\n"
-                       "    }\n")
-              if tsrc.count(g_old) != 1:
-                  print("ERROR: q8mm2 anchor-3 (get_tensor) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(g_old, g_new)
-
-              open(tpath, "w").write(tsrc)
-              print("OK: q8mm2 applied to ggml-hexagon.cpp (3 sites)")
-              raise SystemExit(0)
-
-          if mode == "q8mm3":
-              # 二分隔离版：在 q8mm2 基础上，把 ENCODER 的量化矩阵乘隔离到 CPU。
-              # 背景：fp16 全正常 + 三种 q8 内核变体在真实图里全错（但单元测试全对），
-              # 且 bs=1 时 decode 能跑 219 步却只吐时间戳 token —— 典型「encoder 输出是垃圾」症状。
-              # 做法：set/get_tensor 对名字以 "encoder." 开头的量化权重保持原始布局，
-              # 同时 supported_mul_mat 拒绝 encoder 量化矩阵乘 -> CPU 回退读原始数据（正确）。
-              # decoder 仍在 NPU。若输出变正确 -> encoder NPU q8 路径是凶手。
-              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-              tsrc = open(tpath).read()
-
-              # 1) 同 q8mm
-              q_old = ("    if (!opt_hostbuf) {\n"
-                       "        return ggml_backend_buffer_is_hexagon(b);\n"
-                       "    }\n"
-                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
-              q_new = ("    // SM8850 q8mm3: treat any hexagon buffer as repack\n"
-                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
-                       "    return ggml_backend_buffer_is_hexagon(b);")
-              if tsrc.count(q_old) != 1:
-                  print("ERROR: q8mm3 anchor-1 (is_hexagon_repack) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(q_old, q_new)
-
-              # 2) set_tensor：ne[1] > 32768 或 encoder.* 的量化权重保持原始布局
-              s_old = ('    HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
-              s_new = (s_old +
-                       "\n"
-                       "    // SM8850 q8mm3: keep original (non-tiled) layout for quant weights that\n"
-                       "    // will run on CPU: ne[1] > 32768 (always refused) or encoder.* (bisect).\n"
-                       "    if (ggml_hexagon_is_repack_type(tensor->type) &&\n"
-                       "        (tensor->ne[1] > 32768 || strncmp(tensor->name, \"encoder.\", 8) == 0)) {\n"
-                       "        memcpy((char *) tensor->data + offset, data, size);\n"
-                       "        return;\n"
-                       "    }\n")
-              if tsrc.count(s_old) != 1:
-                  print("ERROR: q8mm3 anchor-2 (set_tensor) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(s_old, s_new)
-
-              # 3) get_tensor：对称
-              g_old = ('    HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\\n", sess->c_name(), tensor->name, data, offset, size);\n')
-              g_new = (g_old +
-                       "\n"
-                       "    // SM8850 q8mm3: mirror of set_tensor guard.\n"
-                       "    if (ggml_hexagon_is_repack_type(tensor->type) &&\n"
-                       "        (tensor->ne[1] > 32768 || strncmp(tensor->name, \"encoder.\", 8) == 0)) {\n"
-                       "        memcpy(data, (const char *) tensor->data + offset, size);\n"
-                       "        return;\n"
-                       "    }\n")
-              if tsrc.count(g_old) != 1:
-                  print("ERROR: q8mm3 anchor-3 (get_tensor) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(g_old, g_new)
-
-              # 4) supported_mul_mat：拒绝 encoder 量化矩阵乘（踢回 CPU，配合 2 的原始布局）
-              m_old = ("        case GGML_TYPE_Q4_0:\n"
-                       "        case GGML_TYPE_Q4_1:\n"
-                       "        case GGML_TYPE_Q8_0:\n"
-                       "        case GGML_TYPE_IQ4_NL:\n"
-                       "        case GGML_TYPE_MXFP4:\n"
-                       "            if (src0->ne[0] % 32) {\n"
-                       "                return false;\n"
-                       "            }")
-              m_new = ("        case GGML_TYPE_Q4_0:\n"
-                       "        case GGML_TYPE_Q4_1:\n"
-                       "        case GGML_TYPE_Q8_0:\n"
-                       "        case GGML_TYPE_IQ4_NL:\n"
-                       "        case GGML_TYPE_MXFP4:\n"
-                       "            // SM8850 q8mm3 bisect: encoder quant matmuls run on CPU\n"
-                       "            // (weights kept in original layout by set_tensor).\n"
-                       "            if (strncmp(src0->name, \"encoder.\", 8) == 0) {\n"
-                       "                return false;\n"
-                       "            }\n"
-                       "            if (src0->ne[0] % 32) {\n"
-                       "                return false;\n"
-                       "            }")
-              if tsrc.count(m_old) != 1:
-                  print("ERROR: q8mm3 anchor-4 (supported_mul_mat) not found, abort!")
-                  raise SystemExit(1)
-              tsrc = tsrc.replace(m_old, m_new)
-
-              open(tpath, "w").write(tsrc)
-              print("OK: q8mm3 applied to ggml-hexagon.cpp (4 sites)")
-              raise SystemExit(0)
-
           if mode == "q8mm5":
               # 【真正的总根源修复】whisper.cpp 加载模型时，因 hexagon 默认 buffer
               # is_host=true，直接 fread 进显存（whisper.cpp:1924），完全绕过 set_tensor
@@ -666,6 +495,112 @@ jobs:
 
               open(tpath, "w").write(tsrc)
               print("OK: q8mm5 applied to ggml-hexagon.cpp (3 sites)")
+              raise SystemExit(0)
+
+          if mode == "q8mm6":
+              # q8mm5 + 解锁 lm-head 上 NPU：上游 ne[1] > 32768 是保守硬编码限制，
+              # fp16 的 lm-head 本就在 NPU 跑；q8 的被踢到 CPU 每步白耗 2~3ms。
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              # 1) 同 q8mm：任意 hexagon buffer 视为 repack
+              q_old = ("    if (!opt_hostbuf) {\n"
+                       "        return ggml_backend_buffer_is_hexagon(b);\n"
+                       "    }\n"
+                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
+              q_new = ("    // SM8850 q8mm6: treat any hexagon buffer as repack\n"
+                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
+                       "    return ggml_backend_buffer_is_hexagon(b);")
+              if tsrc.count(q_old) != 1:
+                  print("ERROR: q8mm6 anchor-1 (is_hexagon_repack) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(q_old, q_new)
+
+              # 2) 全局指针集合（同 q8mm5）
+              g_old = "static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {"
+              g_new = ("// SM8850 q8mm6: track lazily-repacked weight tensors\n"
+                       "#define GGML_Q8MM6_MAX 1024\n"
+                       "static const void * g_q8mm6_tiled[GGML_Q8MM6_MAX];\n"
+                       "static int g_q8mm6_tiled_count = 0;\n"
+                       "\n"
+                       "static bool ggml_q8mm6_is_tiled(const void * p) {\n"
+                       "    for (int i = 0; i < g_q8mm6_tiled_count; i++) {\n"
+                       "        if (g_q8mm6_tiled[i] == p) {\n"
+                       "            return true;\n"
+                       "        }\n"
+                       "    }\n"
+                       "    return false;\n"
+                       "}\n"
+                       "\n"
+                       "static void ggml_q8mm6_mark(const void * p) {\n"
+                       "    if (g_q8mm6_tiled_count < GGML_Q8MM6_MAX) {\n"
+                       "        g_q8mm6_tiled[g_q8mm6_tiled_count++] = p;\n"
+                       "    }\n"
+                       "}\n"
+                       "\n" + g_old)
+              if tsrc.count(g_old) != 1:
+                  print("ERROR: q8mm6 anchor-2 (globals) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(g_old, g_new)
+
+              # 3) lm-head 限制 32768 -> 262144
+              l_old = ("            // hardcoded limit to refuse the lm-head for now\n"
+                       "            if (src0->ne[1] > 32768) {\n"
+                       "                return false;\n"
+                       "            }")
+              l_new = ("            // SM8850 q8mm6: raised hardcoded limit; tiled kernel streams\n"
+                       "            // weights through VTCM so tall weights (lm-head 51866) are fine.\n"
+                       "            if (src0->ne[1] > 262144) {\n"
+                       "                return false;\n"
+                       "            }")
+              if tsrc.count(l_old) != 1:
+                  print("ERROR: q8mm6 anchor-3 (lm-head limit) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(l_old, l_new)
+
+              # 4) 懒 repack hook（同 q8mm5，符号改名 q8mm6）
+              h_old = ("            if (src1->ne[2] != 1 || src1->ne[3] != 1) {\n"
+                       "                return false;  // no broadcasting (for now)\n"
+                       "            }\n"
+                       "\n"
+                       "            // src0 (weights) must be repacked\n"
+                       "            if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {\n"
+                       "                return false;\n"
+                       "            }\n"
+                       "            break;")
+              h_hook = ("\n"
+                       "\n"
+                       "            // SM8850 q8mm6: whisper.cpp reads weights directly into this host\n"
+                       "            // buffer at load (bypassing set_tensor), so repack never ran.\n"
+                       "            // Repack in place on first accepted use.\n"
+                       "            if (src0->data && !ggml_q8mm6_is_tiled(src0->data)) {\n"
+                       "                const size_t q8mm6_nb = ggml_nbytes(src0);\n"
+                       "                void * q8mm6_tmp = malloc(q8mm6_nb);\n"
+                       "                if (q8mm6_tmp) {\n"
+                       "                    memcpy(q8mm6_tmp, src0->data, q8mm6_nb);\n"
+                       "                    ggml_tensor * q8mm6_w = (ggml_tensor *) src0;\n"
+                       "                    switch (src0->type) {\n"
+                       "                        case GGML_TYPE_Q4_0:   repack_q4_0_tiled(q8mm6_w, q8mm6_tmp, q8mm6_nb); break;\n"
+                       "                        case GGML_TYPE_Q4_1:   repack_q4_1_tiled(q8mm6_w, q8mm6_tmp, q8mm6_nb); break;\n"
+                       "                        case GGML_TYPE_Q8_0:   repack_q8_0_tiled(q8mm6_w, q8mm6_tmp, q8mm6_nb); break;\n"
+                       "                        case GGML_TYPE_IQ4_NL: repack_q4_0_tiled(q8mm6_w, q8mm6_tmp, q8mm6_nb); break;\n"
+                       "                        case GGML_TYPE_MXFP4:  repack_mxfp4_tiled(q8mm6_w, q8mm6_tmp, q8mm6_nb); break;\n"
+                       "                        default: break;\n"
+                       "                    }\n"
+                       "                    free(q8mm6_tmp);\n"
+                       "                    ggml_q8mm6_mark(src0->data);\n"
+                       "                    GGML_LOG_INFO(\"ggml-hex: q8mm6 lazy-repacked weight ne %lld x %lld type %d\\n\",\n"
+                       "                                  (long long) src0->ne[0], (long long) src0->ne[1], (int) src0->type);\n"
+                       "                }\n"
+                       "            }")
+              h_new = h_old[:-len("            break;")] + h_hook + "\n            break;"
+              if tsrc.count(h_old) != 1:
+                  print("ERROR: q8mm6 anchor-4 (lazy repack hook) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(h_old, h_new)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: q8mm6 applied to ggml-hexagon.cpp (4 sites)")
               raise SystemExit(0)
 
           if mode == "q8dbg":
