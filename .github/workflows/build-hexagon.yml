@@ -501,9 +501,10 @@ jobs:
                   gel_new = (gel_old + "\n\n"
                              "    // SM8850 geluenc: while whisper.cpp runs the conv+encoder graphs it sets\n"
                              "    // GGML_HEXAGON_GELU_CPU_ONLY; refuse only GELU so it lands on CPU.\n"
-                             "    // The HTP fast-approx GELU kernel corrupts encoder features on\n"
-                             "    // extreme-range activations (turbo always, v3 on loud music).\n"
-                             "    if (op->op == GGML_OP_GELU && getenv(\"GGML_HEXAGON_GELU_CPU_ONLY\")) {\n"
+                             "    // (bundled ggml has no GGML_OP_GELU; GELU is a UNARY sub-op)\n"
+                             "    if (getenv(\"GGML_HEXAGON_GELU_CPU_ONLY\") && op->op == GGML_OP_UNARY &&\n"
+                             "        (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU ||\n"
+                             "         ggml_get_unary_op(op) == GGML_UNARY_OP_GELU_QUICK)) {\n"
                              "        return false;\n"
                              "    }")
                   if tsrc.count(gel_old) != 1:
