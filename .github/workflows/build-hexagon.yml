@@ -363,6 +363,10 @@ jobs:
                       }
                       break;"""
           
+          if mode not in ("fp16", "broadcast", "bcast_only", "noncontig_only"):
+              print("patch_mode=" + mode + " 不在本 step（A），跳过")
+              raise SystemExit(0)
+
           new = {"fp16": fp16_new, "broadcast": bcast_new,
                  "bcast_only": bcast_only_new, "noncontig_only": noncontig_only_new}[mode]
           
