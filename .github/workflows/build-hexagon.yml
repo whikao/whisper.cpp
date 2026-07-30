@@ -610,41 +610,50 @@ jobs:
 
                   open(wpath, "w").write(wsrc)
 
-              # 9) 仅 geludump:whisper.cpp 给每个 sched 挂 eval callback,
-              # GELU 节点计算完成后(ask=false)同时拉回输入与输出,
-              # 用双精度 erf 参考现场对比,打印输入统计 + NMSE/maxdiff/bad。
-              # 环境变量 GGML_HEXAGON_GELUDUMP=1 门控,前 300 次后停止打印。
+              # 9) 仅 geludump:whisper.cpp 给每个 sched 挂 eval callback。
+              # ask=true(计算前,buffer 未被复用)缓存 GELU 输入副本;
+              # ask=false 拉回 HTP 输出,用缓存输入的双精度 erf 参考现场对比。
+              # 环境变量 GGML_HEXAGON_GELUDUMP=1 门控,前 300 次后停止。
               if mode == "geludump":
                   wpath = "src/whisper.cpp"
                   wsrc = open(wpath).read()
 
                   d0_old = "// measure the memory usage of a graph and prepare the allocr's internal data buffer"
                   d0_new = ("// SM8850 geludump: in-situ HTP-vs-reference check of GELU outputs (env GGML_HEXAGON_GELUDUMP=1)\n"
+                            "// Two-phase: cache input at ask=true (buffer still valid), compare output at ask=false.\n"
+                            "#include <map>\n"
                             "static double geludump_erf_ref(double x) {\n"
                             "    return 0.5 * x * (1.0 + erf(x / sqrt(2.0)));\n"
                             "}\n"
+                            "static std::map<const void *, std::vector<float> > g_geludump_cache;\n"
+                            "static int g_geludump_n = 0;\n"
                             "static bool whisper_geludump_cb(struct ggml_tensor * t, bool ask, void * user_data) {\n"
                             "    (void) user_data;\n"
-                            "    if (ask) {\n"
-                            "        return true;\n"
-                            "    }\n"
                             "    if (t->op != GGML_OP_UNARY || ggml_get_unary_op(t) != GGML_UNARY_OP_GELU) {\n"
                             "        return true;\n"
                             "    }\n"
-                            "    static int g_geludump_n = 0;\n"
                             "    if (g_geludump_n >= 300) {\n"
                             "        return true;\n"
                             "    }\n"
-                            "    g_geludump_n++;\n"
                             "    struct ggml_tensor * src = t->src[0];\n"
                             "    if (!src || src->type != GGML_TYPE_F32 || t->type != GGML_TYPE_F32) {\n"
-                            "        fprintf(stderr, \"geludump #%d: skip (types %d -> %d)\\n\", g_geludump_n, src ? (int) src->type : -1, (int) t->type);\n"
                             "        return true;\n"
                             "    }\n"
                             "    size_t nel = ggml_nelements(t);\n"
-                            "    std::vector<float> xin(nel), yout(nel);\n"
-                            "    ggml_backend_tensor_get(src, xin.data(), 0, nel * sizeof(float));\n"
-                            "    ggml_backend_tensor_get(t,   yout.data(), 0, nel * sizeof(float));\n"
+                            "    if (ask) {\n"
+                            "        std::vector<float> & c = g_geludump_cache[t];\n"
+                            "        c.resize(nel);\n"
+                            "        ggml_backend_tensor_get(src, c.data(), 0, nel * sizeof(float));\n"
+                            "        return true;\n"
+                            "    }\n"
+                            "    std::map<const void *, std::vector<float> >::iterator it = g_geludump_cache.find(t);\n"
+                            "    if (it == g_geludump_cache.end()) {\n"
+                            "        return true;\n"
+                            "    }\n"
+                            "    g_geludump_n++;\n"
+                            "    const std::vector<float> & xin = it->second;\n"
+                            "    std::vector<float> yout(nel);\n"
+                            "    ggml_backend_tensor_get(t, yout.data(), 0, nel * sizeof(float));\n"
                             "    double mn = 1e30, mx = -1e30, sum = 0.0, sum2 = 0.0;\n"
                             "    double err2 = 0.0, ref2 = 0.0, maxdiff = 0.0;\n"
                             "    long bad = 0, nan = 0;\n"
@@ -667,6 +676,7 @@ jobs:
                             "    fprintf(stderr, \"geludump #%d: ne %lld x %lld  in[min %8.3f max %8.3f mean %7.3f std %6.3f]  NMSE %.3e maxdiff %.3e bad(>0.5) %ld nan %ld\\n\",\n"
                             "            g_geludump_n, (long long) t->ne[0], (long long) t->ne[1], mn, mx, mean, var > 0 ? sqrt(var) : 0.0,\n"
                             "            ref2 > 0 ? err2 / ref2 : 0.0, maxdiff, bad, nan);\n"
+                            "    g_geludump_cache.erase(it);\n"
                             "    return true;\n"
                             "}\n"
                             "\n"
