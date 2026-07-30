@@ -672,6 +672,149 @@ jobs:
           echo "=== test-backend-ops 构建完成 ==="
           ls -la pkg/test-backend-ops
 
+      # gelu-sweep: whisper 真实形状/幅度下的 GELU 精度扫频(HTP vs double 参考)
+      - name: Build gelu-sweep (GELU 精度扫频探针)
+        run: |
+          set -e
+          SRC=/tmp/gelu-sweep.cpp
+          cat > "$SRC" <<'CPEOF'
+          // gelu-sweep: probe HTP GELU accuracy at whisper-realistic shapes and input scales.
+          // Compares HTP output against a double-precision erf reference computed on host.
+          // Usage: ./gelu-sweep   (set GGML_HEXAGON_OPFUSION=1 externally to test fused path)
+          #include "ggml.h"
+          #include "ggml-backend.h"
+          #include <cmath>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <vector>
+          #include <random>
+
+          static double gelu_ref(double x) {
+              return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0)));
+          }
+
+          // with_matmul=false: out = gelu(x),            x: [d0, d1]
+          // with_matmul=true : out = gelu(w @ x + bias), x: [din, d1], w: [din, d0], din = d0/4
+          static void run_case(ggml_backend_t be, const char * tag, int64_t d0, int64_t d1,
+                               float scale, bool with_matmul) {
+              const int64_t din = with_matmul ? d0/4 : d0;
+              const int64_t ne_in = din * d1;
+              std::mt19937 rng(1234);
+              std::uniform_real_distribution<float> ud(-1.f, 1.f);
+              std::vector<float> x(ne_in);
+              for (auto & v : x) v = ud(rng) * scale;
+
+              struct ggml_init_params ip = { (size_t)512*1024*1024, nullptr, true };
+              ggml_context * ctx = ggml_init(ip);
+
+              ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, din, d1);
+              ggml_tensor * wt  = nullptr;
+              ggml_tensor * bt  = nullptr;
+              ggml_tensor * cur = inp;
+              if (with_matmul) {
+                  wt  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, din, d0);
+                  bt  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d0);
+                  cur = ggml_add(ctx, ggml_mul_mat(ctx, wt, inp), bt);
+              }
+              ggml_tensor * out = ggml_gelu(ctx, cur);
+              ggml_cgraph * gf = ggml_new_graph(ctx);
+              ggml_build_forward_expand(gf, out);
+
+              ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+              if (!buf) { printf("%-28s alloc FAILED\n", tag); ggml_free(ctx); return; }
+
+              ggml_backend_tensor_set(inp, x.data(), 0, ggml_nbytes(inp));
+              std::vector<float> wd, bd;
+              if (with_matmul) {
+                  wd.resize(ggml_nelements(wt));
+                  bd.resize(ggml_nelements(bt));
+                  std::normal_distribution<float> nd(0.f, 0.05f);
+                  for (auto & v : wd) v = nd(rng);
+                  for (auto & v : bd) v = nd(rng);
+                  ggml_backend_tensor_set(wt, wd.data(), 0, ggml_nbytes(wt));
+                  ggml_backend_tensor_set(bt, bd.data(), 0, ggml_nbytes(bt));
+              }
+
+              if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+                  printf("%-28s compute FAILED\n", tag);
+                  ggml_backend_buffer_free(buf); ggml_free(ctx); return;
+              }
+
+              std::vector<float> y(ggml_nelements(out));
+              ggml_backend_tensor_get(out, y.data(), 0, ggml_nbytes(out));
+
+              double sse = 0, sref = 0, maxdiff = 0;
+              int n_bad = 0, n_nan = 0;
+              for (int64_t j = 0; j < d1; j++) {
+                  for (int64_t i = 0; i < d0; i++) {
+                      double r;
+                      if (!with_matmul) {
+                          r = gelu_ref(x[j*din + i]);
+                      } else {
+                          double acc = bd[i];
+                          for (int64_t k = 0; k < din; k++)
+                              acc += (double)wd[i*din + k] * x[j*din + k];
+                          r = gelu_ref(acc);
+                      }
+                      double d = y[j*d0 + i] - r;
+                      if (std::isnan(y[j*d0 + i])) n_nan++;
+                      sse += d*d; sref += r*r;
+                      if (std::fabs(d) > maxdiff) maxdiff = std::fabs(d);
+                      if (std::fabs(d) > 0.5) n_bad++;
+                  }
+              }
+              printf("%-28s NMSE %.3e  maxdiff %.3e  bad(>0.5) %d  nan %d\n",
+                     tag, sref > 0 ? sse/sref : 0.0, maxdiff, n_bad, n_nan);
+
+              ggml_backend_buffer_free(buf);
+              ggml_free(ctx);
+          }
+
+          int main() {
+              ggml_backend_load_all();
+              ggml_backend_t htp = nullptr;
+              const int ndev = ggml_backend_dev_count();
+              for (int i = 0; i < ndev; i++) {
+                  ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                  const char * nm = ggml_backend_dev_name(dev);
+                  if (nm && strncmp(nm, "HTP", 3) == 0) {
+                      htp = ggml_backend_dev_init(dev, nullptr);
+                      printf("using device: %s\n", nm);
+                      break;
+                  }
+              }
+              if (!htp) { printf("no HTP device found\n"); return 1; }
+              printf("OPFUSION env: %s\n", getenv("GGML_HEXAGON_OPFUSION") ? getenv("GGML_HEXAGON_OPFUSION") : "(unset)");
+
+              const float scales[] = {1, 4, 8, 16, 32, 64};
+              printf("\n--- A: standalone GELU [5120x1500] (encoder MLP shape) ---\n");
+              for (float s : scales) {
+                  char tag[64]; snprintf(tag, sizeof tag, "A gelu 5120x1500 x%-5g", s);
+                  run_case(htp, tag, 5120, 1500, s, false);
+              }
+              printf("\n--- B: matmul+bias+GELU [1280->5120 x 300] (MLP chain) ---\n");
+              const float scalesB[] = {1, 8, 32, 64};
+              for (float s : scalesB) {
+                  char tag[64]; snprintf(tag, sizeof tag, "B mm+gelu 1280>5120 x%-5g", s);
+                  run_case(htp, tag, 5120, 300, s, true);
+              }
+              ggml_backend_free(htp);
+              return 0;
+          }
+          CPEOF
+          CXX=$(ls ${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang++ | sort -V | tail -n 1)
+          GGML_LIBS=$(find build/bin -maxdepth 1 -name "libggml*.so" | sort | tr '\n' ' ')
+          mkdir -p pkg
+          "$CXX" -std=c++17 -O2 -fPIC -pthread \
+            -I/tmp/llama/ggml/include \
+            "$SRC" \
+            $GGML_LIBS \
+            -Wl,-rpath,'$ORIGIN' \
+            -o pkg/gelu-sweep
+          echo "=== gelu-sweep 构建完成 ==="
+          ls -la pkg/gelu-sweep
+
       - name: 打包编译产物
         run: |
           mkdir -p pkg
