@@ -697,7 +697,8 @@ jobs:
           // with_matmul=false: out = gelu(x),            x: [d0, d1]
           // with_matmul=true : out = gelu(w @ x + bias), x: [din, d1], w: [din, d0], din = d0/4
           static void run_case(ggml_backend_t be, const char * tag, int64_t d0, int64_t d1,
-                               float scale, bool with_matmul) {
+                               float scale, int mode) {
+              const bool with_matmul = mode > 0;
               const int64_t din = with_matmul ? d0/4 : d0;
               const int64_t ne_in = din * d1;
               std::mt19937 rng(1234);
@@ -713,7 +714,7 @@ jobs:
               ggml_tensor * bt  = nullptr;
               ggml_tensor * cur = inp;
               if (with_matmul) {
-                  wt  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, din, d0);
+                  wt  = ggml_new_tensor_2d(ctx, mode == 2 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32, din, d0);
                   bt  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d0);
                   cur = ggml_add(ctx, ggml_mul_mat(ctx, wt, inp), bt);
               }
@@ -727,12 +728,18 @@ jobs:
               ggml_backend_tensor_set(inp, x.data(), 0, ggml_nbytes(inp));
               std::vector<float> wd, bd;
               if (with_matmul) {
-                  wd.resize(ggml_nelements(wt));
+                  wd.resize(din * d0);
                   bd.resize(ggml_nelements(bt));
                   std::normal_distribution<float> nd(0.f, 0.05f);
                   for (auto & v : wd) v = nd(rng);
                   for (auto & v : bd) v = nd(rng);
-                  ggml_backend_tensor_set(wt, wd.data(), 0, ggml_nbytes(wt));
+                  if (mode == 2) {
+                      std::vector<char> qd(ggml_nbytes(wt));
+                      ggml_quantize_chunk(GGML_TYPE_Q8_0, wd.data(), qd.data(), 0, d0, din, nullptr);
+                      ggml_backend_tensor_set(wt, qd.data(), 0, qd.size());
+                  } else {
+                      ggml_backend_tensor_set(wt, wd.data(), 0, ggml_nbytes(wt));
+                  }
                   ggml_backend_tensor_set(bt, bd.data(), 0, ggml_nbytes(bt));
               }
 
@@ -791,13 +798,18 @@ jobs:
               printf("\n--- A: standalone GELU [5120x1500] (encoder MLP shape) ---\n");
               for (float s : scales) {
                   char tag[64]; snprintf(tag, sizeof tag, "A gelu 5120x1500 x%-5g", s);
-                  run_case(htp, tag, 5120, 1500, s, false);
+                  run_case(htp, tag, 5120, 1500, s, 0);
               }
               printf("\n--- B: matmul+bias+GELU [1280->5120 x 300] (MLP chain) ---\n");
               const float scalesB[] = {1, 8, 32, 64};
               for (float s : scalesB) {
                   char tag[64]; snprintf(tag, sizeof tag, "B mm+gelu 1280>5120 x%-5g", s);
-                  run_case(htp, tag, 5120, 300, s, true);
+                  run_case(htp, tag, 5120, 300, s, 1);
+              }
+              printf("\n--- C: q8_0 matmul+bias+GELU [1280->5120 x 300] (real MLP weights) ---\n");
+              for (float s : scalesB) {
+                  char tag[64]; snprintf(tag, sizeof tag, "C q8mm+gelu x%-5g", s);
+                  run_case(htp, tag, 5120, 300, s, 2);
               }
               ggml_backend_free(htp);
               return 0;
