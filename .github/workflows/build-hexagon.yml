@@ -105,14 +105,16 @@ jobs:
           ls ggml/src/ggml-hexagon/htp/ || true
 
       # 【ADD 补丁】在覆盖之后、编译之前打。找不到锚点会显式报错（防止白编）
-      - name: 按需打 ADD 算子补丁 (patch_mode=${{ inputs.patch_mode }})
+      - name: 打 ADD 补丁 A 组 (patch_mode=${{ inputs.patch_mode }})
         run: |
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
+
           if mode == "none":
               print("patch_mode=none，跳过补丁")
               raise SystemExit(0)
           
+
           if mode == "hmxfix":
               # 放宽 HMX 矩阵乘的行数门槛：M=4 (bs3 bo3) 也走 HMX
               # 实测 bs5 bo5 (M=6) 走 HMX 后每行吞吐为 HVX 的 1.7 倍
@@ -207,6 +209,195 @@ jobs:
               open(tpath, "w").write(tsrc.replace(t_old, t_new))
               print("OK: hmxfix2 applied to ggml-hexagon.cpp")
               raise SystemExit(0)
+
+          if mode == "prof":
+              # 诊断版：把 profile 逐算子耗时日志从 DEBUG 提为 INFO（release 构建可见）
+              # 运行时配合 GGML_HEXAGON_PROFILE=3（或1）使用
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
+              t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
+
+              if tsrc.count(t_old) != 2:
+                  print("ERROR: prof anchor count != 2 in ggml-hexagon.cpp, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: prof applied to ggml-hexagon.cpp (2 log sites)")
+              raise SystemExit(0)
+
+          if mode == "flushfix":
+              # 修缓存层：对所有 compute 输入无条件 flush，绕过 dirty 区间跟踪（htp/htp-tensor.c）
+              tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
+              tsrc = open(tpath).read()
+
+              t_old = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && is_tensor_dirty(ctx, t)) {"
+              t_new = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && (is_tensor_dirty(ctx, t) || true)) { // SM8850 v81 fix: unconditional flush"
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: flushfix anchor not found in htp-tensor.c, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: flushfix applied to htp-tensor.c")
+              raise SystemExit(0)
+
+          if mode in ("kernelfix", "krowbcast"):
+              # 修 kernel：收紧 same_shape 判定；kernelfix=禁用row_bcast，krowbcast=保留row_bcast
+              kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
+              ksrc = open(kpath).read()
+          
+              k_old = (
+                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&\n"
+                  "               (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&\n"
+                  "               (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);\n"
+                  "\n"
+                  "    bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);")
+          
+              k_new = (
+                  "    // SM8850 v81 fix: same_shape requires full 4-dim equality (dim-broadcast DMA read OOB)\n"
+                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == src0->ne[1]) &&\n"
+                  "               (src1->ne[2] == src0->ne[2]) &&\n"
+                  "               (src1->ne[3] == src0->ne[3]);\n"
+                  "\n"
+                  "    // SM8850 v81 fix: disable row_bcast fast path; broadcast ADD goes to complex path\n"
+                  "    bool is_row_bcast = false;")
+          
+              k_new_rb = (
+                  "    // SM8850 v81 fix: same_shape requires full 4-dim equality (dim-broadcast DMA read OOB)\n"
+                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == src0->ne[1]) &&\n"
+                  "               (src1->ne[2] == src0->ne[2]) &&\n"
+                  "               (src1->ne[3] == src0->ne[3]);\n"
+                  "\n"
+                  "    // SM8850 v81 fix: row_bcast kept, defined independently of same_shape\n"
+                  "    bool is_row_bcast = !is_add_id && !is_scalar && !is_transposed &&\n"
+                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
+                  "               (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);")
+
+              k_use = k_new if mode == "kernelfix" else k_new_rb
+              if ksrc.count(k_old) != 1:
+                  print("ERROR: kernel patch anchor not found in binary-ops.c, abort!")
+                  raise SystemExit(1)
+              open(kpath, "w").write(ksrc.replace(k_old, k_use))
+              print("OK: %s applied to binary-ops.c" % mode)
+              raise SystemExit(0)
+          
+          path = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          src = open(path).read()
+          
+          old = """        case GGML_OP_MUL:
+                  case GGML_OP_ADD:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;"""
+          
+          fp16_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+          
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: non-fp32 ADD broken on HTP, fall back to CPU
+                      if (supp && (op->src[0]->type != GGML_TYPE_F32 ||
+                                   op->src[1]->type != GGML_TYPE_F32)) {
+                          supp = false;
+                      }
+                      break;"""
+          
+          bcast_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+          
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: broadcast/non-contiguous ADD broken on HTP, fall back to CPU
+                      if (supp && (!ggml_is_contiguous(op->src[0]) ||
+                                   !ggml_is_contiguous(op->src[1]) ||
+                                   op->src[0]->ne[0] != op->src[1]->ne[0] ||
+                                   op->src[0]->ne[1] != op->src[1]->ne[1] ||
+                                   op->src[0]->ne[2] != op->src[1]->ne[2] ||
+                                   op->src[0]->ne[3] != op->src[1]->ne[3])) {
+                          supp = false;
+                      }
+                      break;"""
+          
+          bcast_only_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+          
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: broadcast/non-contiguous ADD broken on HTP, fall back to CPU
+                      if (supp && (op->src[0]->ne[0] != op->src[1]->ne[0] ||
+                                   op->src[0]->ne[1] != op->src[1]->ne[1] ||
+                                   op->src[0]->ne[2] != op->src[1]->ne[2] ||
+                                   op->src[0]->ne[3] != op->src[1]->ne[3])) {
+                          supp = false;
+                      }
+                      break;"""
+          
+          noncontig_only_new = """        case GGML_OP_MUL:
+                  case GGML_OP_SUB:
+                  case GGML_OP_DIV:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      break;
+          
+                  case GGML_OP_ADD:
+                      supp = ggml_hexagon_supported_binary(sess, op);
+                      // SM8850 v81 workaround: non-contiguous ADD broken on HTP, fall back to CPU
+                      if (supp && (!ggml_is_contiguous(op->src[0]) ||
+                                   !ggml_is_contiguous(op->src[1]))) {
+                          supp = false;
+                      }
+                      break;"""
+          
+          new = {"fp16": fp16_new, "broadcast": bcast_new,
+                 "bcast_only": bcast_only_new, "noncontig_only": noncontig_only_new}[mode]
+          
+          if src.count(old) != 1:
+              print("ERROR: patch anchor not found (upstream changed), abort!")
+              raise SystemExit(1)
+          
+          open(path, "w").write(src.replace(old, new))
+          print("OK: %s patch applied" % mode)
+
+          if mode == "flushfix2":
+              # 轻量变体：每个 op 前整片 L2 刷一次（比逐张量 flush 便宜），绕过 dirty 跟踪
+              tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
+              tsrc = open(tpath).read()
+
+              t_old = ("void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {\n"
+                       "    const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];")
+              t_new = ("void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {\n"
+                       "    flush_all_dcache(ctx); // SM8850 v81 fix: full L2 flush per op, bypass dirty tracking\n"
+                       "    const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];")
+
+              if tsrc.count(t_old) != 1:
+                  print("ERROR: flushfix2 anchor not found in htp-tensor.c, abort!")
+                  raise SystemExit(1)
+              open(tpath, "w").write(tsrc.replace(t_old, t_new))
+              print("OK: flushfix2 applied to htp-tensor.c")
+              raise SystemExit(0)
+
+          print("patch_mode=" + mode + " 不在本 step（A），跳过")
+          EOF
+
+      - name: 打 ADD 补丁 B 组 q8 系列 (patch_mode=${{ inputs.patch_mode }})
+        run: |
+          python3 - << 'EOF'
+          mode = "${{ inputs.patch_mode }}"
 
           if mode == "q8mm":
               # 让 q8_0 等量化权重的 MUL_MAT 在 whisper.cpp 下也能上 NPU。
@@ -438,186 +629,7 @@ jobs:
               print("OK: q8dbg applied to ggml-hexagon.cpp (4 sites)")
               raise SystemExit(0)
 
-          if mode == "prof":
-              # 诊断版：把 profile 逐算子耗时日志从 DEBUG 提为 INFO（release 构建可见）
-              # 运行时配合 GGML_HEXAGON_PROFILE=3（或1）使用
-              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-              tsrc = open(tpath).read()
-
-              t_old = 'GGML_LOG_DEBUG("ggml-hex: %s profile-'
-              t_new = 'GGML_LOG_INFO("ggml-hex: %s profile-'
-
-              if tsrc.count(t_old) != 2:
-                  print("ERROR: prof anchor count != 2 in ggml-hexagon.cpp, abort!")
-                  raise SystemExit(1)
-              open(tpath, "w").write(tsrc.replace(t_old, t_new))
-              print("OK: prof applied to ggml-hexagon.cpp (2 log sites)")
-              raise SystemExit(0)
-
-          if mode == "flushfix2":
-              # 轻量变体：每个 op 前整片 L2 刷一次（比逐张量 flush 便宜），绕过 dirty 跟踪
-              tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
-              tsrc = open(tpath).read()
-
-              t_old = ("void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {\n"
-                       "    const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];")
-              t_new = ("void htp_tensor_flush_all(struct htp_context * ctx, const struct htp_tensor * const * tensors, uint32_t n) {\n"
-                       "    flush_all_dcache(ctx); // SM8850 v81 fix: full L2 flush per op, bypass dirty tracking\n"
-                       "    const struct htp_tensor * dirty_tensors[HTP_OP_MAX_INPUTS];")
-
-              if tsrc.count(t_old) != 1:
-                  print("ERROR: flushfix2 anchor not found in htp-tensor.c, abort!")
-                  raise SystemExit(1)
-              open(tpath, "w").write(tsrc.replace(t_old, t_new))
-              print("OK: flushfix2 applied to htp-tensor.c")
-              raise SystemExit(0)
-
-          if mode == "flushfix":
-              # 修缓存层：对所有 compute 输入无条件 flush，绕过 dirty 区间跟踪（htp/htp-tensor.c）
-              tpath = "ggml/src/ggml-hexagon/htp/htp-tensor.c"
-              tsrc = open(tpath).read()
-
-              t_old = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && is_tensor_dirty(ctx, t)) {"
-              t_new = "        if (t && (t->flags & HTP_TENSOR_COMPUTE) && (is_tensor_dirty(ctx, t) || true)) { // SM8850 v81 fix: unconditional flush"
-
-              if tsrc.count(t_old) != 1:
-                  print("ERROR: flushfix anchor not found in htp-tensor.c, abort!")
-                  raise SystemExit(1)
-              open(tpath, "w").write(tsrc.replace(t_old, t_new))
-              print("OK: flushfix applied to htp-tensor.c")
-              raise SystemExit(0)
-
-          if mode in ("kernelfix", "krowbcast"):
-              # 修 kernel：收紧 same_shape 判定；kernelfix=禁用row_bcast，krowbcast=保留row_bcast
-              kpath = "ggml/src/ggml-hexagon/htp/binary-ops.c"
-              ksrc = open(kpath).read()
-          
-              k_old = (
-                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
-                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
-                  "               (src1->ne[1] == src0->ne[1] || src1->ne[1] == 1) &&\n"
-                  "               (src1->ne[2] == src0->ne[2] || src1->ne[2] == 1) &&\n"
-                  "               (src1->ne[3] == src0->ne[3] || src1->ne[3] == 1);\n"
-                  "\n"
-                  "    bool is_row_bcast = is_same_shape && (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);")
-          
-              k_new = (
-                  "    // SM8850 v81 fix: same_shape requires full 4-dim equality (dim-broadcast DMA read OOB)\n"
-                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
-                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
-                  "               (src1->ne[1] == src0->ne[1]) &&\n"
-                  "               (src1->ne[2] == src0->ne[2]) &&\n"
-                  "               (src1->ne[3] == src0->ne[3]);\n"
-                  "\n"
-                  "    // SM8850 v81 fix: disable row_bcast fast path; broadcast ADD goes to complex path\n"
-                  "    bool is_row_bcast = false;")
-          
-              k_new_rb = (
-                  "    // SM8850 v81 fix: same_shape requires full 4-dim equality (dim-broadcast DMA read OOB)\n"
-                  "    bool is_same_shape = !is_add_id && !is_scalar && !is_transposed &&\n"
-                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
-                  "               (src1->ne[1] == src0->ne[1]) &&\n"
-                  "               (src1->ne[2] == src0->ne[2]) &&\n"
-                  "               (src1->ne[3] == src0->ne[3]);\n"
-                  "\n"
-                  "    // SM8850 v81 fix: row_bcast kept, defined independently of same_shape\n"
-                  "    bool is_row_bcast = !is_add_id && !is_scalar && !is_transposed &&\n"
-                  "               (src1->ne[0] == src0->ne[0] && src0->ne[0] % VLEN == 0) &&\n"
-                  "               (src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);")
-
-              k_use = k_new if mode == "kernelfix" else k_new_rb
-              if ksrc.count(k_old) != 1:
-                  print("ERROR: kernel patch anchor not found in binary-ops.c, abort!")
-                  raise SystemExit(1)
-              open(kpath, "w").write(ksrc.replace(k_old, k_use))
-              print("OK: %s applied to binary-ops.c" % mode)
-              raise SystemExit(0)
-          
-          path = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
-          src = open(path).read()
-          
-          old = """        case GGML_OP_MUL:
-                  case GGML_OP_ADD:
-                  case GGML_OP_SUB:
-                  case GGML_OP_DIV:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      break;"""
-          
-          fp16_new = """        case GGML_OP_MUL:
-                  case GGML_OP_SUB:
-                  case GGML_OP_DIV:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      break;
-          
-                  case GGML_OP_ADD:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: non-fp32 ADD broken on HTP, fall back to CPU
-                      if (supp && (op->src[0]->type != GGML_TYPE_F32 ||
-                                   op->src[1]->type != GGML_TYPE_F32)) {
-                          supp = false;
-                      }
-                      break;"""
-          
-          bcast_new = """        case GGML_OP_MUL:
-                  case GGML_OP_SUB:
-                  case GGML_OP_DIV:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      break;
-          
-                  case GGML_OP_ADD:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: broadcast/non-contiguous ADD broken on HTP, fall back to CPU
-                      if (supp && (!ggml_is_contiguous(op->src[0]) ||
-                                   !ggml_is_contiguous(op->src[1]) ||
-                                   op->src[0]->ne[0] != op->src[1]->ne[0] ||
-                                   op->src[0]->ne[1] != op->src[1]->ne[1] ||
-                                   op->src[0]->ne[2] != op->src[1]->ne[2] ||
-                                   op->src[0]->ne[3] != op->src[1]->ne[3])) {
-                          supp = false;
-                      }
-                      break;"""
-          
-          bcast_only_new = """        case GGML_OP_MUL:
-                  case GGML_OP_SUB:
-                  case GGML_OP_DIV:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      break;
-          
-                  case GGML_OP_ADD:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: broadcast/non-contiguous ADD broken on HTP, fall back to CPU
-                      if (supp && (op->src[0]->ne[0] != op->src[1]->ne[0] ||
-                                   op->src[0]->ne[1] != op->src[1]->ne[1] ||
-                                   op->src[0]->ne[2] != op->src[1]->ne[2] ||
-                                   op->src[0]->ne[3] != op->src[1]->ne[3])) {
-                          supp = false;
-                      }
-                      break;"""
-          
-          noncontig_only_new = """        case GGML_OP_MUL:
-                  case GGML_OP_SUB:
-                  case GGML_OP_DIV:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      break;
-          
-                  case GGML_OP_ADD:
-                      supp = ggml_hexagon_supported_binary(sess, op);
-                      // SM8850 v81 workaround: non-contiguous ADD broken on HTP, fall back to CPU
-                      if (supp && (!ggml_is_contiguous(op->src[0]) ||
-                                   !ggml_is_contiguous(op->src[1]))) {
-                          supp = false;
-                      }
-                      break;"""
-          
-          new = {"fp16": fp16_new, "broadcast": bcast_new,
-                 "bcast_only": bcast_only_new, "noncontig_only": noncontig_only_new}[mode]
-          
-          if src.count(old) != 1:
-              print("ERROR: patch anchor not found (upstream changed), abort!")
-              raise SystemExit(1)
-          
-          open(path, "w").write(src.replace(old, new))
-          print("OK: %s patch applied" % mode)
+          print("patch_mode=" + mode + " 不在本 step（B），跳过")
           EOF
           echo "=== patched ADD branch ==="
           grep -n -A 12 "case GGML_OP_ADD:" ggml/src/ggml-hexagon/ggml-hexagon.cpp | head -40 || true
