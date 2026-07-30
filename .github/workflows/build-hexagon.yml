@@ -505,6 +505,7 @@ jobs:
                              "    if (getenv(\"GGML_HEXAGON_GELU_CPU_ONLY\") && op->op == GGML_OP_UNARY &&\n"
                              "        (ggml_get_unary_op(op) == GGML_UNARY_OP_GELU ||\n"
                              "         ggml_get_unary_op(op) == GGML_UNARY_OP_GELU_QUICK)) {\n"
+                             "        fprintf(stderr, \"ggml-hex: geluenc refuse %s\\n\", ggml_op_desc(op));\n"
                              "        return false;\n"
                              "    }")
                   if tsrc.count(gel_old) != 1:
