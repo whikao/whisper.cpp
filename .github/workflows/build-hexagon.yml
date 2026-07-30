@@ -28,6 +28,7 @@ on:
           - q8mm
           - q8mm2
           - q8mm3
+          - q8mm5
           - q8dbg
         default: 'kernelfix'
         required: true
@@ -570,6 +571,101 @@ jobs:
 
               open(tpath, "w").write(tsrc)
               print("OK: q8mm3 applied to ggml-hexagon.cpp (4 sites)")
+              raise SystemExit(0)
+
+          if mode == "q8mm5":
+              # 【真正的总根源修复】whisper.cpp 加载模型时，因 hexagon 默认 buffer
+              # is_host=true，直接 fread 进显存（whisper.cpp:1924），完全绕过 set_tensor
+              # —— tiled repack 从未发生！DSP 内核按 tiled 布局读原始 q8 数据 = 全垃圾。
+              # 这解释：fp16 正常 / q8 三内核变体全错 / 单元测试全对 / set_tensor 守卫无效。
+              # 修复：supported_mul_mat 接受某量化权重时，就地懒 repack（首次见到才做，
+              # 指针集合记录）。ne[1]>32768 的 lm-head 在 hook 之前已被拒绝，保持原始布局。
+              tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+              tsrc = open(tpath).read()
+
+              # 1) 同 q8mm：任意 hexagon buffer 视为 repack
+              q_old = ("    if (!opt_hostbuf) {\n"
+                       "        return ggml_backend_buffer_is_hexagon(b);\n"
+                       "    }\n"
+                       "    return b->buft->iface.alloc_buffer == ggml_backend_hexagon_repack_buffer_type_alloc_buffer;")
+              q_new = ("    // SM8850 q8mm5: treat any hexagon buffer as repack\n"
+                       "    // (HOSTBUF=0 semantics without its is_host side-effects).\n"
+                       "    return ggml_backend_buffer_is_hexagon(b);")
+              if tsrc.count(q_old) != 1:
+                  print("ERROR: q8mm5 anchor-1 (is_hexagon_repack) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(q_old, q_new)
+
+              # 2) 全局：已 repack 权重指针集合
+              g_old = "static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * sess, const struct ggml_tensor * dst) {"
+              g_new = ("// SM8850 q8mm5: track lazily-repacked weight tensors\n"
+                       "#define GGML_Q8MM5_MAX 1024\n"
+                       "static const void * g_q8mm5_tiled[GGML_Q8MM5_MAX];\n"
+                       "static int g_q8mm5_tiled_count = 0;\n"
+                       "\n"
+                       "static bool ggml_q8mm5_is_tiled(const void * p) {\n"
+                       "    for (int i = 0; i < g_q8mm5_tiled_count; i++) {\n"
+                       "        if (g_q8mm5_tiled[i] == p) {\n"
+                       "            return true;\n"
+                       "        }\n"
+                       "    }\n"
+                       "    return false;\n"
+                       "}\n"
+                       "\n"
+                       "static void ggml_q8mm5_mark(const void * p) {\n"
+                       "    if (g_q8mm5_tiled_count < GGML_Q8MM5_MAX) {\n"
+                       "        g_q8mm5_tiled[g_q8mm5_tiled_count++] = p;\n"
+                       "    }\n"
+                       "}\n"
+                       "\n" + g_old)
+              if tsrc.count(g_old) != 1:
+                  print("ERROR: q8mm5 anchor-2 (globals) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(g_old, g_new)
+
+              # 3) 懒 repack hook：插进 supported_mul_mat 量化分支末尾（所有检查通过后）
+              h_old = ("            if (src1->ne[2] != 1 || src1->ne[3] != 1) {\n"
+                       "                return false;  // no broadcasting (for now)\n"
+                       "            }\n"
+                       "\n"
+                       "            // src0 (weights) must be repacked\n"
+                       "            if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {\n"
+                       "                return false;\n"
+                       "            }\n"
+                       "            break;")
+              h_hook = ("\n"
+                       "\n"
+                       "            // SM8850 q8mm5: whisper.cpp reads weights directly into this host\n"
+                       "            // buffer at load (bypassing set_tensor), so repack never ran.\n"
+                       "            // Repack in place on first accepted use.\n"
+                       "            if (src0->data && !ggml_q8mm5_is_tiled(src0->data)) {\n"
+                       "                const size_t q8mm5_nb = ggml_nbytes(src0);\n"
+                       "                void * q8mm5_tmp = malloc(q8mm5_nb);\n"
+                       "                if (q8mm5_tmp) {\n"
+                       "                    memcpy(q8mm5_tmp, src0->data, q8mm5_nb);\n"
+                       "                    ggml_tensor * q8mm5_w = (ggml_tensor *) src0;\n"
+                       "                    switch (src0->type) {\n"
+                       "                        case GGML_TYPE_Q4_0:   repack_q4_0_tiled(q8mm5_w, q8mm5_tmp, q8mm5_nb); break;\n"
+                       "                        case GGML_TYPE_Q4_1:   repack_q4_1_tiled(q8mm5_w, q8mm5_tmp, q8mm5_nb); break;\n"
+                       "                        case GGML_TYPE_Q8_0:   repack_q8_0_tiled(q8mm5_w, q8mm5_tmp, q8mm5_nb); break;\n"
+                       "                        case GGML_TYPE_IQ4_NL: repack_q4_0_tiled(q8mm5_w, q8mm5_tmp, q8mm5_nb); break;\n"
+                       "                        case GGML_TYPE_MXFP4:  repack_mxfp4_tiled(q8mm5_w, q8mm5_tmp, q8mm5_nb); break;\n"
+                       "                        default: break;\n"
+                       "                    }\n"
+                       "                    free(q8mm5_tmp);\n"
+                       "                    ggml_q8mm5_mark(src0->data);\n"
+                       "                    GGML_LOG_INFO(\"ggml-hex: q8mm5 lazy-repacked weight ne %lld x %lld type %d\\n\",\n"
+                       "                                  (long long) src0->ne[0], (long long) src0->ne[1], (int) src0->type);\n"
+                       "                }\n"
+                       "            }")
+              h_new = h_old[:-len("            break;")] + h_hook + "\n            break;"
+              if tsrc.count(h_old) != 1:
+                  print("ERROR: q8mm5 anchor-3 (lazy repack hook) not found, abort!")
+                  raise SystemExit(1)
+              tsrc = tsrc.replace(h_old, h_new)
+
+              open(tpath, "w").write(tsrc)
+              print("OK: q8mm5 applied to ggml-hexagon.cpp (3 sites)")
               raise SystemExit(0)
 
           if mode == "q8dbg":
