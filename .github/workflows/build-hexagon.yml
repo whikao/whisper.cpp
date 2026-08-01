@@ -756,6 +756,67 @@ jobs:
           grep -n -A 12 "case GGML_OP_ADD:" ggml/src/ggml-hexagon/ggml-hexagon.cpp | head -40 || true
           grep -n "is_row_bcast = false" ggml/src/ggml-hexagon/htp/binary-ops.c || true
 
+      - name: 打 hybrid 调度补丁 (whisper.cpp 跳过 Vulkan 选 GPU, HTP 装模型, Vulkan 垫底算子)
+        if: inputs.patch_mode == 'hybrid'
+        run: |
+          python3 << 'EOF'
+          wpath = "src/whisper.cpp"
+          wsrc = open(wpath).read()
+
+          # 1) whisper_backend_init_gpu: 环境变量 WHISPER_HYBRID_HEXAGON=1 时跳过 Vulkan 设备,
+          #    让 HTP0 成为唯一 GPU 候选 (权重进 HTP, lazy-repack 恢复)
+          a1_old = ("            enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev_cur);\n"
+                    "            const char * dev_name = ggml_backend_dev_name(dev_cur);\n")
+          a1_new = a1_old + ("            if (getenv(\"WHISPER_HYBRID_HEXAGON\") && std::string(dev_name).find(\"Vulkan\") != std::string::npos) {\n"
+                    "                WHISPER_LOG_INFO(\"%s: hybrid 模式跳过 GPU 设备 %s (留给调度垫底)\\n\", __func__, dev_name);\n"
+                    "                continue;\n"
+                    "            }\n")
+          assert wsrc.count(a1_old) == 1, "anchor1 不唯一"
+          wsrc = wsrc.replace(a1_old, a1_new)
+
+          # 2) whisper_backend_init: HTP 入选后, 把被跳过的 Vulkan 设备初始化为第二后端
+          #    调度顺序变 [HTP, Vulkan, CPU]: HTP 拒收的 GELU 落 Vulkan, 不落 CPU
+          a2_old = ("    if (backend_gpu) {\n"
+                    "        result.push_back(backend_gpu);\n"
+                    "    }\n")
+          a2_new = a2_old + ("\n"
+                    "    if (getenv(\"WHISPER_HYBRID_HEXAGON\")) {\n"
+                    "        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {\n"
+                    "            ggml_backend_dev_t dev_h = ggml_backend_dev_get(i);\n"
+                    "            if (ggml_backend_dev_type(dev_h) == GGML_BACKEND_DEVICE_TYPE_GPU &&\n"
+                    "                std::string(ggml_backend_dev_name(dev_h)).find(\"Vulkan\") != std::string::npos) {\n"
+                    "                ggml_backend_t b = ggml_backend_dev_init(dev_h, nullptr);\n"
+                    "                if (b) {\n"
+                    "                    WHISPER_LOG_INFO(\"%s: hybrid 模式挂载垫底后端 %s\\n\", __func__, ggml_backend_dev_name(dev_h));\n"
+                    "                    result.push_back(b);\n"
+                    "                }\n"
+                    "            }\n"
+                    "        }\n"
+                    "    }\n")
+          assert wsrc.count(a2_old) == 1, "anchor2 不唯一"
+          wsrc = wsrc.replace(a2_old, a2_new)
+
+          # 3) make_buft_list: 同样跳过 Vulkan, 权重 buffer 类型用 HTP 的 (lazy-repack 生效)
+          a3_old = ("        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {\n"
+                    "            ggml_backend_dev_t dev = ggml_backend_dev_get(i);\n"
+                    "            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {\n"
+                    "                if (cnt == params.gpu_device) {\n")
+          a3_new = ("        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {\n"
+                    "            ggml_backend_dev_t dev = ggml_backend_dev_get(i);\n"
+                    "            if (getenv(\"WHISPER_HYBRID_HEXAGON\") && std::string(ggml_backend_dev_name(dev)).find(\"Vulkan\") != std::string::npos) {\n"
+                    "                continue;\n"
+                    "            }\n"
+                    "            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {\n"
+                    "                if (cnt == params.gpu_device) {\n")
+          assert wsrc.count(a3_old) == 1, "anchor3 不唯一"
+          wsrc = wsrc.replace(a3_old, a3_new)
+
+          open(wpath, "w").write(wsrc)
+          print("OK: hybrid 调度补丁 applied")
+          EOF
+          echo "=== hybrid 调度补丁验证 ==="
+          grep -n "WHISPER_HYBRID_HEXAGON" src/whisper.cpp
+
       - name: 安装 glslc (hybrid 模式的 Vulkan shader 编译器)
         if: inputs.patch_mode == 'hybrid'
         run: |
