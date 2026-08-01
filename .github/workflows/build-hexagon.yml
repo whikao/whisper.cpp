@@ -760,8 +760,9 @@ jobs:
         if: inputs.patch_mode == 'hybrid'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y glslc
+          sudo apt-get install -y glslc glslang-tools spirv-headers spirv-tools
           glslc --version
+          glslangValidator --version
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
