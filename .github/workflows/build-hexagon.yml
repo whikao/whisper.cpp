@@ -778,13 +778,18 @@ jobs:
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
           test -f /tmp/vulkan-headers/include/vulkan/vulkan.hpp
           echo "VULKAN_HEADERS_INCLUDE=/tmp/vulkan-headers/include" >> "$GITHUB_ENV"
+          # SPIRV 头文件也要显式给交叉编译器 (NDK 不搜 /usr/local/include)
+          if [ ! -f /tmp/spirv-headers/include/spirv/unified1/spirv.hpp ]; then
+            git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
+          fi
+          echo "SPIRV_HEADERS_INCLUDE=/tmp/spirv-headers/include" >> "$GITHUB_ENV"
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
           mkdir -p build && cd build
           VULKAN_FLAG=""
           if [ "${{ inputs.patch_mode }}" = "hybrid" ]; then
-            VULKAN_FLAG="-DGGML_VULKAN=ON -DSPIRV-Headers_DIR=${{ env.SPIRV_HEADERS_DIR }} -DVulkan_INCLUDE_DIR=${{ env.VULKAN_HEADERS_INCLUDE }}"
+            VULKAN_FLAG="-DGGML_VULKAN=ON -DSPIRV-Headers_DIR=${{ env.SPIRV_HEADERS_DIR }} -DVulkan_INCLUDE_DIR=${{ env.VULKAN_HEADERS_INCLUDE }} -DCMAKE_CXX_FLAGS=-I${{ env.SPIRV_HEADERS_INCLUDE }}"
             echo "=== hybrid 模式: Hexagon + Vulkan 双后端 ==="
           fi
           cmake .. \
