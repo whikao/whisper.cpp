@@ -31,6 +31,7 @@ on:
           - vdbg
           - nospin
           - hybrid
+          - gelusync
         default: 'kernelfix'
         required: true
 
@@ -448,7 +449,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -819,6 +820,42 @@ jobs:
           EOF
           echo "=== hybrid 调度补丁验证 ==="
           grep -n "WHISPER_HYBRID_HEXAGON" src/whisper.cpp
+
+      - name: 打 gelusync 补丁 (GELU 留在 NPU, 每个 GELU 后插入主机同步点)
+        if: inputs.patch_mode == 'gelusync'
+        run: |
+          python3 << 'EOF'
+          hpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          hsrc = open(hpath).read()
+
+          g_old = ("    if (opt_opstage & HTP_OPSTAGE_QUEUE) {\n"
+                   "        for (const auto & node : *nodes_ptr) {\n"
+                   "            sess->enqueue_op(node);\n"
+                   "        }\n"
+                   "    }\n")
+          g_new = ("    if (opt_opstage & HTP_OPSTAGE_QUEUE) {\n"
+                   "        // SM8850 gelusync: GELU 留在 NPU 执行, 但在每个 GELU(或任意 unary)后\n"
+                   "        // 插入主机同步点, 等 DSP 完成并刷出结果再提交下游算子,\n"
+                   "        // 绕过固件异步链上 unary 输出对后续算子不可见的 bug。\n"
+                   "        // env GGML_HEXAGON_GELUSYNC: 1=每个 GELU 后同步, 2=每个 unary 后同步\n"
+                   "        const char * gs_env = getenv(\"GGML_HEXAGON_GELUSYNC\");\n"
+                   "        const int gelusync_mode = gs_env ? atoi(gs_env) : 0;\n"
+                   "        for (const auto & node : *nodes_ptr) {\n"
+                   "            sess->enqueue_op(node);\n"
+                   "            if (gelusync_mode == 1 && node.opcode == HTP_OP_UNARY_GELU) {\n"
+                   "                sess->flush();\n"
+                   "            } else if (gelusync_mode == 2 && htp_op_is_unary(node.opcode)) {\n"
+                   "                sess->flush();\n"
+                   "            }\n"
+                   "        }\n"
+                   "    }\n")
+          assert hsrc.count(g_old) == 1, "gelusync anchor 不唯一: %d" % hsrc.count(g_old)
+          hsrc = hsrc.replace(g_old, g_new)
+          open(hpath, "w").write(hsrc)
+          print("OK: gelusync applied")
+          EOF
+          echo "=== gelusync 补丁验证 ==="
+          grep -n -A 14 "SM8850 gelusync" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 安装 glslc (hybrid 模式的 Vulkan shader 编译器)
         if: inputs.patch_mode == 'hybrid'
