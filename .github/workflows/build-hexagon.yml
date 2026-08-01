@@ -774,13 +774,17 @@ jobs:
           echo "SPIRV-Headers config dir: $CFG_DIR"
           test -n "$CFG_DIR"
           echo "SPIRV_HEADERS_DIR=$CFG_DIR" >> "$GITHUB_ENV"
+          # NDK 只有 vulkan.h 没有 vulkan.hpp (Vulkan-Hpp), 从官方仓库取完整头文件
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          test -f /tmp/vulkan-headers/include/vulkan/vulkan.hpp
+          echo "VULKAN_HEADERS_INCLUDE=/tmp/vulkan-headers/include" >> "$GITHUB_ENV"
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
           mkdir -p build && cd build
           VULKAN_FLAG=""
           if [ "${{ inputs.patch_mode }}" = "hybrid" ]; then
-            VULKAN_FLAG="-DGGML_VULKAN=ON -DSPIRV-Headers_DIR=${{ env.SPIRV_HEADERS_DIR }}"
+            VULKAN_FLAG="-DGGML_VULKAN=ON -DSPIRV-Headers_DIR=${{ env.SPIRV_HEADERS_DIR }} -DVulkan_INCLUDE_DIR=${{ env.VULKAN_HEADERS_INCLUDE }}"
             echo "=== hybrid 模式: Hexagon + Vulkan 双后端 ==="
           fi
           cmake .. \
