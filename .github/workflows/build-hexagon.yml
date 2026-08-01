@@ -32,6 +32,7 @@ on:
           - nospin
           - hybrid
           - gelusync
+          - geluxact
         default: 'kernelfix'
         required: true
 
@@ -449,7 +450,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -856,6 +857,140 @@ jobs:
           EOF
           echo "=== gelusync 补丁验证 ==="
           grep -n -A 14 "SM8850 gelusync" ggml/src/ggml-hexagon/ggml-hexagon.cpp
+
+      - name: 打 geluxact 补丁 (DSP skel GELU 换成精确 erf, 弃用 sigmoid 近似)
+        if: inputs.patch_mode == 'geluxact'
+        run: |
+          python3 << 'EOF'
+          upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
+          usrc = open(upath).read()
+
+          # 现有 DSP skel 把 GELU 实现为 x*sigmoid(1.702x) (GELU_QUICK 近似),
+          # 但 ggml-hexagon 把精确的 GGML_UNARY_OP_GELU (erf) 也映射到同一个 HTP op。
+          # 在 x∈[-4,-1] 区间相对误差最高 ~77% (max abs 0.0203 @ x=-2.27),
+          # 足以污染 encoder/decoder 激活 → 幻听/循环。本补丁换成精确 erf:
+          #   erf(z) 用 Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
+          #   gelu(x) = x * 0.5 * (1 + erf(x * 0.70710678f))
+          helper = r'''
+          // SM8850 geluxact: exact erf GELU (matches ggml GELU reference), not sigmoid approx.
+          // erf(z) via Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7):
+          //   t = 1/(1 + p*|z|); erf(|z|) = 1 - (((((a5*t+a4)*t+a3)*t+a2)*t+a1)*t) * exp(-z*z)
+          #define HVX_GX_MUL(a, b)    Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), Q6_V_vzero()))
+          #define HVX_GX_FMA(a, b, c) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), c))
+
+          static inline HVX_Vector hvx_vec_gelu_exact_f32(HVX_Vector x) {
+              const HVX_Vector half   = hvx_vec_splat_f32(0.5f);
+              const HVX_Vector one    = hvx_vec_splat_f32(1.0f);
+              const HVX_Vector zero   = hvx_vec_splat_f32(0.0f);
+              const HVX_Vector invsq2 = hvx_vec_splat_f32(0.70710678f);
+              const HVX_Vector cp     = hvx_vec_splat_f32(0.3275911f);
+              const HVX_Vector a1     = hvx_vec_splat_f32(0.254829592f);
+              const HVX_Vector a2     = hvx_vec_splat_f32(-0.284496736f);
+              const HVX_Vector a3     = hvx_vec_splat_f32(1.421413741f);
+              const HVX_Vector a4     = hvx_vec_splat_f32(-1.453152027f);
+              const HVX_Vector a5     = hvx_vec_splat_f32(1.061405429f);
+
+              const HVX_Vector z  = HVX_GX_MUL(x, invsq2);
+              const HVX_Vector az = hvx_vec_abs_f32(z);
+
+              const HVX_Vector t = hvx_vec_inverse_f32(HVX_GX_FMA(cp, az, one));
+
+              HVX_Vector poly = HVX_GX_FMA(t, a5, a4);
+              poly = HVX_GX_FMA(t, poly, a3);
+              poly = HVX_GX_FMA(t, poly, a2);
+              poly = HVX_GX_FMA(t, poly, a1);
+              poly = HVX_GX_MUL(t, poly);
+
+              const HVX_Vector zz = HVX_GX_MUL(z, z);
+              const HVX_Vector e  = hvx_vec_exp_f32(hvx_vec_neg_f32(zz));
+
+              const HVX_Vector erf_abs = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, HVX_GX_MUL(poly, e)));
+
+              const HVX_VectorPred neg = Q6_Q_vcmp_gt_VsfVsf(zero, z);
+              const HVX_Vector erf_v   = Q6_V_vmux_QVV(neg, hvx_vec_neg_f32(erf_abs), erf_abs);
+
+              const HVX_Vector r = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, erf_v));
+              return HVX_GX_MUL(x, HVX_GX_MUL(half, r));
+          }
+
+          #define hvx_gelu_exact_loop_body(dst_type, src_type, vec_store) \
+              do {                                                        \
+                  dst_type * restrict vdst = (dst_type *) dst;            \
+                  src_type * restrict vsrc = (src_type *) src;            \
+                                                                          \
+                  const uint32_t epv  = 128 / sizeof(float);              \
+                  const uint32_t nvec = n / epv;                          \
+                  const uint32_t nloe = n % epv;                          \
+                                                                          \
+                  uint32_t i = 0;                                         \
+                                                                          \
+                  _Pragma("unroll(4)")                                    \
+                  for (; i < nvec; i++) {                                 \
+                       vdst[i] = hvx_vec_gelu_exact_f32(vsrc[i]);         \
+                  }                                                       \
+                  if (nloe) {                                             \
+                       HVX_Vector tmp = hvx_vec_gelu_exact_f32(vsrc[i]);  \
+                       vec_store((void *) &vdst[i], nloe * sizeof(float), tmp); \
+                  }                                                       \
+              } while(0)
+
+          static inline void hvx_gelu_exact_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+              hvx_gelu_exact_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+          }
+          '''
+
+          g1_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_mul_scalar_f32(dst_local, src_local, 1.702f, ne0);
+                  hvx_sigmoid_f32_aa(dst_local, dst_local, ne0);
+                  hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
+              }
+          }'''
+          g1_new = helper + '''
+          // gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (exact erf, matches CPU GELU reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_gelu_exact_f32_aa(dst_local, src_local, ne0);
+              }
+          }'''
+          assert usrc.count(g1_old) == 1, "geluxact anchor-1 (gelu_f32) 不唯一: %d" % usrc.count(g1_old)
+          usrc = usrc.replace(g1_old, g1_new)
+
+          g2_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_mul_scalar_f32(dst_vtcm, src_vtcm, 1.702f, tw);
+              hvx_sigmoid_f32_aa(dst_vtcm, dst_vtcm, tw);
+              hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+          }'''
+          g2_new = '''// gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (exact erf, matches CPU GELU reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_gelu_exact_f32_aa(dst_vtcm, src_vtcm, tw);
+          }'''
+          assert usrc.count(g2_old) == 1, "geluxact anchor-2 (tile_gelu_f32) 不唯一: %d" % usrc.count(g2_old)
+          usrc = usrc.replace(g2_old, g2_new)
+
+          open(upath, "w").write(usrc)
+          print("OK: geluxact applied (gelu_f32 + tile_gelu_f32 -> exact erf)")
+          EOF
+          echo "=== geluxact 补丁验证 ==="
+          grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
 
       - name: 安装 glslc (hybrid 模式的 Vulkan shader 编译器)
         if: inputs.patch_mode == 'hybrid'
