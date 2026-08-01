@@ -1,0 +1,469 @@
+name: Build whisper.cpp (Hexagon HTP v81, upstream+geluxact only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_branch:
+        description: 'whisper.cpp branch'
+        default: 'master'
+        required: true
+# 显式赋予创建 Release 的写入权限
+permissions:
+  contents: write
+
+jobs:
+  build-android-hexagon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          repository: 'ggml-org/whisper.cpp'
+          ref: ${{ github.event.inputs.whisper_branch }}
+          submodules: recursive
+
+      - name: 安装编译依赖工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build wget xz-utils
+
+      - name: 下载并设置 Android NDK r28
+        run: |
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r28-linux.zip
+          unzip -q android-ndk-r28-linux.zip
+          echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
+
+      - name: 下载并解压 Hexagon SDK v6.6.0.0
+        run: |
+          cd /tmp
+          wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+          tar -xf hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+          # 动态自动定位包含 'incs' 的真实根目录
+          SDK_ROOT=$(find /tmp -maxdepth 3 -type d -name "incs" 2>/dev/null | head -n 1 | xargs dirname)
+          if [ -n "$SDK_ROOT" ]; then
+            echo "HEXAGON_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+            echo "✅ 成功定位 SDK 真实根目录: $SDK_ROOT"
+            TOOLS_PATH=$(find $SDK_ROOT -path "*/HEXAGON_Tools/19.0.07" 2>/dev/null | head -n 1)
+            if [ -n "$TOOLS_PATH" ]; then
+              echo "HEXAGON_TOOLS_ROOT=$TOOLS_PATH" >> $GITHUB_ENV
+              echo "✅ 成功定位 Tools 目录: $TOOLS_PATH"
+            else
+              echo "❌ 错误: 在 SDK 根目录下未发现 HEXAGON_Tools/19.0.07！"
+              exit 1
+            fi
+          else
+            echo "❌ 错误: 解压后未找到包含 'incs' 文件夹的 SDK 目录，请检查解压包！"
+            exit 1
+          fi
+
+      - name: 修复官方 SDK 的 CMake 兼容性问题
+        run: |
+          CMAKE_FILE=$(find /tmp -path "*/build/cmake/hexagon_fun.cmake" 2>/dev/null | head -n 1)
+          if [ -n "$CMAKE_FILE" ]; then
+            sed -i '99,106s/^/# /' "$CMAKE_FILE"
+            echo "✅ 成功修复 CMake 文件: $CMAKE_FILE"
+          else
+            echo "⚠️ 未找到 hexagon_fun.cmake，跳过修复步骤。"
+          fi
+
+      # 【核心改动】用 llama.cpp 最新的 ggml-hexagon 整体覆盖 whisper.cpp 自带的旧版
+      - name: 覆盖最新 ggml-hexagon（含 L2 缓存重做 + HMX 修复）
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama
+          rm -rf ggml/src/ggml-hexagon
+          cp -r /tmp/llama/ggml/src/ggml-hexagon ggml/src/
+          cp -f /tmp/llama/ggml/include/ggml-hexagon.h ggml/include/ggml-hexagon.h
+          echo "=== 覆盖完成，新版关键默认值（应显示 mm_select=3 / fa_select=2）==="
+          grep -n "opt_mm_select = \|opt_fa_select = " ggml/src/ggml-hexagon/ggml-hexagon.cpp || true
+          echo "=== 确认新版文件就位（应有 dma-queue.c / work-queue.c / htp-tensor.c）==="
+          ls ggml/src/ggml-hexagon/htp/ || true
+
+      # 【ADD 补丁】在覆盖之后、编译之前打。找不到锚点会显式报错（防止白编）
+      - name: 打 geluxact 补丁 (DSP skel GELU 换成精确 erf, 弃用 sigmoid 近似; gelupure=仅此补丁,不带B组)
+        run: |
+          python3 << 'EOF'
+          upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
+          usrc = open(upath).read()
+
+          # 现有 DSP skel 把 GELU 实现为 x*sigmoid(1.702x) (GELU_QUICK 近似),
+          # 但 ggml-hexagon 把精确的 GGML_UNARY_OP_GELU (erf) 也映射到同一个 HTP op。
+          # 在 x∈[-4,-1] 区间相对误差最高 ~77% (max abs 0.0203 @ x=-2.27),
+          # 足以污染 encoder/decoder 激活 → 幻听/循环。本补丁换成精确 erf:
+          #   erf(z) 用 Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7)
+          #   gelu(x) = x * 0.5 * (1 + erf(x * 0.70710678f))
+          helper = r'''
+          // SM8850 geluxact: exact erf GELU (matches ggml GELU reference), not sigmoid approx.
+          // erf(z) via Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7):
+          //   t = 1/(1 + p*|z|); erf(|z|) = 1 - (((((a5*t+a4)*t+a3)*t+a2)*t+a1)*t) * exp(-z*z)
+          #define HVX_GX_MUL(a, b)    Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), Q6_V_vzero()))
+          #define HVX_GX_FMA(a, b, c) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), c))
+
+          static inline HVX_Vector hvx_vec_gelu_exact_f32(HVX_Vector x) {
+              const HVX_Vector half   = hvx_vec_splat_f32(0.5f);
+              const HVX_Vector one    = hvx_vec_splat_f32(1.0f);
+              const HVX_Vector zero   = hvx_vec_splat_f32(0.0f);
+              const HVX_Vector invsq2 = hvx_vec_splat_f32(0.70710678f);
+              const HVX_Vector cp     = hvx_vec_splat_f32(0.3275911f);
+              const HVX_Vector a1     = hvx_vec_splat_f32(0.254829592f);
+              const HVX_Vector a2     = hvx_vec_splat_f32(-0.284496736f);
+              const HVX_Vector a3     = hvx_vec_splat_f32(1.421413741f);
+              const HVX_Vector a4     = hvx_vec_splat_f32(-1.453152027f);
+              const HVX_Vector a5     = hvx_vec_splat_f32(1.061405429f);
+
+              const HVX_Vector z  = HVX_GX_MUL(x, invsq2);
+              const HVX_Vector az = hvx_vec_abs_f32(z);
+
+              const HVX_Vector t = hvx_vec_inverse_f32(HVX_GX_FMA(cp, az, one));
+
+              HVX_Vector poly = HVX_GX_FMA(t, a5, a4);
+              poly = HVX_GX_FMA(t, poly, a3);
+              poly = HVX_GX_FMA(t, poly, a2);
+              poly = HVX_GX_FMA(t, poly, a1);
+              poly = HVX_GX_MUL(t, poly);
+
+              const HVX_Vector zz = HVX_GX_MUL(z, z);
+              const HVX_Vector e  = hvx_vec_exp_f32(hvx_vec_neg_f32(zz));
+
+              const HVX_Vector erf_abs = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, HVX_GX_MUL(poly, e)));
+
+              const HVX_VectorPred neg = Q6_Q_vcmp_gt_VsfVsf(zero, z);
+              const HVX_Vector erf_v   = Q6_V_vmux_QVV(neg, hvx_vec_neg_f32(erf_abs), erf_abs);
+
+              const HVX_Vector r = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, erf_v));
+              return HVX_GX_MUL(x, HVX_GX_MUL(half, r));
+          }
+
+          #define hvx_gelu_exact_loop_body(dst_type, src_type, vec_store) \
+              do {                                                        \
+                  dst_type * restrict vdst = (dst_type *) dst;            \
+                  src_type * restrict vsrc = (src_type *) src;            \
+                                                                          \
+                  const uint32_t epv  = 128 / sizeof(float);              \
+                  const uint32_t nvec = n / epv;                          \
+                  const uint32_t nloe = n % epv;                          \
+                                                                          \
+                  uint32_t i = 0;                                         \
+                                                                          \
+                  _Pragma("unroll(4)")                                    \
+                  for (; i < nvec; i++) {                                 \
+                       vdst[i] = hvx_vec_gelu_exact_f32(vsrc[i]);         \
+                  }                                                       \
+                  if (nloe) {                                             \
+                       HVX_Vector tmp = hvx_vec_gelu_exact_f32(vsrc[i]);  \
+                       vec_store((void *) &vdst[i], nloe * sizeof(float), tmp); \
+                  }                                                       \
+              } while(0)
+
+          static inline void hvx_gelu_exact_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+              hvx_gelu_exact_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+          }
+          '''
+
+          g1_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_mul_scalar_f32(dst_local, src_local, 1.702f, ne0);
+                  hvx_sigmoid_f32_aa(dst_local, dst_local, ne0);
+                  hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
+              }
+          }'''
+          g1_new = helper + '''
+          // gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (exact erf, matches CPU GELU reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_gelu_exact_f32_aa(dst_local, src_local, ne0);
+              }
+          }'''
+          assert usrc.count(g1_old) == 1, "geluxact anchor-1 (gelu_f32) 不唯一: %d" % usrc.count(g1_old)
+          usrc = usrc.replace(g1_old, g1_new)
+
+          g2_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_mul_scalar_f32(dst_vtcm, src_vtcm, 1.702f, tw);
+              hvx_sigmoid_f32_aa(dst_vtcm, dst_vtcm, tw);
+              hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+          }'''
+          g2_new = '''// gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (exact erf, matches CPU GELU reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_gelu_exact_f32_aa(dst_vtcm, src_vtcm, tw);
+          }'''
+          assert usrc.count(g2_old) == 1, "geluxact anchor-2 (tile_gelu_f32) 不唯一: %d" % usrc.count(g2_old)
+          usrc = usrc.replace(g2_old, g2_new)
+
+          open(upath, "w").write(usrc)
+          print("OK: geluxact applied (gelu_f32 + tile_gelu_f32 -> exact erf)")
+          EOF
+          echo "=== geluxact 补丁验证 ==="
+          grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
+
+      - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DGGML_HEXAGON=ON \
+            -DGGML_CPU_ARM_ARCH=armv9.2-a+i8mm+sme2 \
+            -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK }}/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=latest \
+            -DHEXAGON_SDK_ROOT=${{ env.HEXAGON_SDK_ROOT }} \
+            -DHEXAGON_TOOLS_ROOT=${{ env.HEXAGON_TOOLS_ROOT }} \
+            -DHTP_ARCH_VERSION=v81 \
+            -DWHISPER_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: 开始多线程编译
+        run: |
+          cd build
+          make -j$(nproc)
+
+      # 用与主构建相同的 NDK clang++ 手工编译 llama.cpp 的 test-backend-ops，
+      # 链接主构建产出的 libggml*.so（libggml-htp-v81.so 运行时由 dlopen 加载，无需链接）
+      - name: Build test-backend-ops (llama.cpp 算子正确性测试)
+        run: |
+          set -e
+          set -x
+          echo "=== 下载 test-backend-ops 源码（固定 7-09 commit，匹配 whisper 的 ggml 快照） ==="
+          # master 版的测试源码引用了 dsv4_hc / lightning_indexer 等新算子，
+          # whisper.cpp 的 ggml 快照（约 7-10）没有这些符号，链接会失败。
+          # 故用 2026-07-09 的 commit f84a51940375 版本（q8 hexagon 支持已存在，新算子未引入）。
+          SRC=/tmp/test-backend-ops.cpp
+          curl -sL --fail https://raw.githubusercontent.com/ggml-org/llama.cpp/f84a5194037564a8231674ee807b3afb4a95a39a/tests/test-backend-ops.cpp -o "$SRC"
+          ls -la "$SRC"
+          # 与主构建一致：NDK r28 aarch64-linux-android clang++，arm64-v8a，最高 API level
+          CXX=$(ls ${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang++ | sort -V | tail -n 1)
+          echo "=== 使用编译器: $CXX ==="
+          "$CXX" --version
+          echo "=== 主构建产出的 ggml 库 ==="
+          find build -name "libggml*.so*" | sort
+          # 只链接宿主侧库 build/bin/libggml*.so（排除 DSP 侧 libggml-htp-vXX.so，非 aarch64）
+          GGML_LIBS=$(find build/bin -maxdepth 1 -name "libggml*.so" | sort | tr '\n' ' ')
+          echo "=== 链接库: $GGML_LIBS ==="
+          mkdir -p pkg
+          "$CXX" -std=c++17 -O2 -fPIC -pthread \
+            -I/tmp/llama/ggml/include \
+            -I/tmp/llama/ggml/src \
+            "$SRC" \
+            $GGML_LIBS \
+            -Wl,-rpath,'$ORIGIN' \
+            -o pkg/test-backend-ops
+          echo "=== test-backend-ops 构建完成 ==="
+          ls -la pkg/test-backend-ops
+
+      # gelu-sweep: whisper 真实形状/幅度下的 GELU 精度扫频(HTP vs double 参考)
+      - name: Build gelu-sweep (GELU 精度扫频探针)
+        run: |
+          set -e
+          SRC=/tmp/gelu-sweep.cpp
+          cat > "$SRC" <<'CPEOF'
+          // gelu-sweep: probe HTP GELU accuracy at whisper-realistic shapes and input scales.
+          // Compares HTP output against a double-precision erf reference computed on host.
+          // Usage: ./gelu-sweep   (set GGML_HEXAGON_OPFUSION=1 externally to test fused path)
+          #include "ggml.h"
+          #include "ggml-backend.h"
+          #include <cmath>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <vector>
+          #include <random>
+
+          static double gelu_ref(double x) {
+              return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0)));
+          }
+
+          // with_matmul=false: out = gelu(x),            x: [d0, d1]
+          // with_matmul=true : out = gelu(w @ x + bias), x: [din, d1], w: [din, d0], din = d0/4
+          static void run_case(ggml_backend_t be, const char * tag, int64_t d0, int64_t d1,
+                               float scale, int mode) {
+              const bool with_matmul = mode > 0;
+              const int64_t din = with_matmul ? d0/4 : d0;
+              const int64_t ne_in = din * d1;
+              std::mt19937 rng(1234);
+              std::uniform_real_distribution<float> ud(-1.f, 1.f);
+              std::vector<float> x(ne_in);
+              for (auto & v : x) v = ud(rng) * scale;
+
+              struct ggml_init_params ip = { (size_t)512*1024*1024, nullptr, true };
+              ggml_context * ctx = ggml_init(ip);
+
+              ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, din, d1);
+              ggml_tensor * wt  = nullptr;
+              ggml_tensor * bt  = nullptr;
+              ggml_tensor * cur = inp;
+              if (with_matmul) {
+                  wt  = ggml_new_tensor_2d(ctx, mode == 2 ? GGML_TYPE_Q8_0 : GGML_TYPE_F32, din, d0);
+                  bt  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d0);
+                  cur = ggml_add(ctx, ggml_mul_mat(ctx, wt, inp), bt);
+              }
+              ggml_tensor * out = ggml_gelu(ctx, cur);
+              ggml_cgraph * gf = ggml_new_graph(ctx);
+              ggml_build_forward_expand(gf, out);
+
+              ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+              if (!buf) { printf("%-28s alloc FAILED\n", tag); ggml_free(ctx); return; }
+
+              ggml_backend_tensor_set(inp, x.data(), 0, ggml_nbytes(inp));
+              std::vector<float> wd, bd;
+              if (with_matmul) {
+                  wd.resize(din * d0);
+                  bd.resize(ggml_nelements(bt));
+                  std::normal_distribution<float> nd(0.f, 0.05f);
+                  for (auto & v : wd) v = nd(rng);
+                  for (auto & v : bd) v = nd(rng);
+                  if (mode == 2) {
+                      std::vector<char> qd(ggml_nbytes(wt));
+                      ggml_quantize_chunk(GGML_TYPE_Q8_0, wd.data(), qd.data(), 0, d0, din, nullptr);
+                      ggml_backend_tensor_set(wt, qd.data(), 0, qd.size());
+                  } else {
+                      ggml_backend_tensor_set(wt, wd.data(), 0, ggml_nbytes(wt));
+                  }
+                  ggml_backend_tensor_set(bt, bd.data(), 0, ggml_nbytes(bt));
+              }
+
+              if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+                  printf("%-28s compute FAILED\n", tag);
+                  ggml_backend_buffer_free(buf); ggml_free(ctx); return;
+              }
+
+              std::vector<float> y(ggml_nelements(out));
+              ggml_backend_tensor_get(out, y.data(), 0, ggml_nbytes(out));
+
+              double sse = 0, sref = 0, maxdiff = 0;
+              int n_bad = 0, n_nan = 0;
+              for (int64_t j = 0; j < d1; j++) {
+                  for (int64_t i = 0; i < d0; i++) {
+                      double r;
+                      if (!with_matmul) {
+                          r = gelu_ref(x[j*din + i]);
+                      } else {
+                          double acc = bd[i];
+                          for (int64_t k = 0; k < din; k++)
+                              acc += (double)wd[i*din + k] * x[j*din + k];
+                          r = gelu_ref(acc);
+                      }
+                      double d = y[j*d0 + i] - r;
+                      if (std::isnan(y[j*d0 + i])) n_nan++;
+                      sse += d*d; sref += r*r;
+                      if (std::fabs(d) > maxdiff) maxdiff = std::fabs(d);
+                      if (std::fabs(d) > 0.5) n_bad++;
+                  }
+              }
+              printf("%-28s NMSE %.3e  maxdiff %.3e  bad(>0.5) %d  nan %d\n",
+                     tag, sref > 0 ? sse/sref : 0.0, maxdiff, n_bad, n_nan);
+
+              ggml_backend_buffer_free(buf);
+              ggml_free(ctx);
+          }
+
+          int main() {
+              ggml_backend_load_all();
+              ggml_backend_t htp = nullptr;
+              const int ndev = ggml_backend_dev_count();
+              for (int i = 0; i < ndev; i++) {
+                  ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                  const char * nm = ggml_backend_dev_name(dev);
+                  if (nm && strncmp(nm, "HTP", 3) == 0) {
+                      htp = ggml_backend_dev_init(dev, nullptr);
+                      printf("using device: %s\n", nm);
+                      break;
+                  }
+              }
+              if (!htp) { printf("no HTP device found\n"); return 1; }
+              printf("OPFUSION env: %s\n", getenv("GGML_HEXAGON_OPFUSION") ? getenv("GGML_HEXAGON_OPFUSION") : "(unset)");
+
+              const float scales[] = {1, 4, 8, 16, 32, 64};
+              printf("\n--- A: standalone GELU [5120x1500] (encoder MLP shape) ---\n");
+              for (float s : scales) {
+                  char tag[64]; snprintf(tag, sizeof tag, "A gelu 5120x1500 x%-5g", s);
+                  run_case(htp, tag, 5120, 1500, s, 0);
+              }
+              printf("\n--- B: matmul+bias+GELU [1280->5120 x 300] (MLP chain) ---\n");
+              const float scalesB[] = {1, 8, 32, 64};
+              for (float s : scalesB) {
+                  char tag[64]; snprintf(tag, sizeof tag, "B mm+gelu 1280>5120 x%-5g", s);
+                  run_case(htp, tag, 5120, 300, s, 1);
+              }
+              printf("\n--- C: q8_0 matmul+bias+GELU [1280->5120 x 300] (real MLP weights) ---\n");
+              for (float s : scalesB) {
+                  char tag[64]; snprintf(tag, sizeof tag, "C q8mm+gelu x%-5g", s);
+                  run_case(htp, tag, 5120, 300, s, 2);
+              }
+              ggml_backend_free(htp);
+              return 0;
+          }
+          CPEOF
+          CXX=$(ls ${{ env.ANDROID_NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang++ | sort -V | tail -n 1)
+          GGML_LIBS=$(find build/bin -maxdepth 1 -name "libggml*.so" | sort | tr '\n' ' ')
+          mkdir -p pkg
+          "$CXX" -std=c++17 -O2 -fPIC -pthread \
+            -I/tmp/llama/ggml/include \
+            "$SRC" \
+            $GGML_LIBS \
+            -Wl,-rpath,'$ORIGIN' \
+            -o pkg/gelu-sweep
+          echo "=== gelu-sweep 构建完成 ==="
+          ls -la pkg/gelu-sweep
+
+      - name: 打包编译产物
+        run: |
+          mkdir -p pkg
+          find build -name "*.so" | xargs -I{} cp {} pkg/
+          find build -name "*.so.*" | xargs -I{} cp {} pkg/
+          find build -path "*ggml-hexagon*" -name "libggml-htp*.so" -exec cp {} pkg/ \;
+          find build/bin -type f -executable | xargs -I{} cp {} pkg/ 2>/dev/null || true
+          cd pkg && zip -r ../whisper-hexagon-v81.zip . && cd ..
+          echo "=== 打包内容 ==="
+          ls -la pkg/
+
+      - name: 上传编译产物 (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-hexagon-v81-geluxact-android
+          path: whisper-hexagon-v81.zip
+          if-no-files-found: error
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v81-geluxact-build-${{ github.run_number }}
+          name: Whisper Hexagon v81 [geluxact] Build #${{ github.run_number }}
+          body: |
+            Android Hexagon v81 构建产物 (SM8850)
+            补丁模式: geluxact
+
+            ## 本版改动
+            - 用 llama.cpp 最新 ggml-hexagon 整体覆盖（whisper.cpp 自带版停在 7-10）
+            - 新增：L2 缓存一致性重做（dirty bit 跟踪 + 延迟刷写）
+            - 新增：hmx-queue 修复、MUL_MAT / FLASH_ATTN 管线优化
+            - 新增：WHISPER_BUILD_TESTS=ON，产物含 test-vad 等测试程序
+            - 补丁：仅 geluxact（DSP skel GELU 精确 erf），无任何 A/B 组补丁
+
+            ## Termux 使用
+            ```bash
+            export LD_LIBRARY_PATH=.:/vendor/lib64
+            ./whisper-cli -m ggml-large-v3-turbo-q8_0.bin -f audio.wav --output-srt
+            # 算子正确性测试：
+            ./test-backend-ops -b HTP0 -o ADD
+            ```
+            注意：whisper-cli、libggml*.so、libggml-htp-v81.so 必须整套换新，不要新旧混用
+          files: whisper-hexagon-v81.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
