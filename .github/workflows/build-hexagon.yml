@@ -763,6 +763,12 @@ jobs:
           sudo apt-get install -y glslc glslang-tools spirv-headers spirv-tools
           glslc --version
           glslangValidator --version
+          # apt 的 spirv-headers 不带 CMake config, 从源码装一份供 find_package 使用
+          if ! ls /usr/lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake /usr/local/lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake 2>/dev/null; then
+            git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git /tmp/spirv-headers
+            cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build -DCMAKE_BUILD_TYPE=Release
+            sudo cmake --install /tmp/spirv-headers/build
+          fi
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
