@@ -29,6 +29,7 @@ on:
           - geluenc
           - geludump
           - vdbg
+          - nospin
         default: 'kernelfix'
         required: true
 
@@ -112,6 +113,28 @@ jobs:
 
           if mode == "none":
               print("patch_mode=none，跳过补丁")
+              raise SystemExit(0)
+
+          if mode == "nospin":
+              # nospin: ggml 线程池默认 poll=50(混合自旋),工作线程空闲时
+              # 自旋 ~1024*128*50 轮才睡眠,空转烧电。改为环境变量
+              # GGML_THREADPOLL 控制:设 0 = 直接睡眠,不设 = 默认 50。
+              gpath = "ggml/src/ggml.c"
+              gsrc = open(gpath).read()
+              p_old = "    p->poll       = 50;    // hybrid-polling enabled"
+              p_new = ("    p->poll       = 50;    // hybrid-polling enabled\n"
+                       "    {\n"
+                       "        // SM8850 nospin: env GGML_THREADPOLL overrides polling level\n"
+                       "        const char * tp_env = getenv(\"GGML_THREADPOLL\");\n"
+                       "        if (tp_env) {\n"
+                       "            p->poll = (uint32_t) atoi(tp_env);\n"
+                       "        }\n"
+                       "    }")
+              if gsrc.count(p_old) != 1:
+                  print("ERROR: nospin anchor (poll=50) not found, abort!")
+                  raise SystemExit(1)
+              open(gpath, "w").write(gsrc.replace(p_old, p_new))
+              print("OK: nospin poll env override applied, q8mm5 补丁在 B 组 step 继续")
               raise SystemExit(0)
 
           if mode == "vdbg":
@@ -424,7 +447,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
