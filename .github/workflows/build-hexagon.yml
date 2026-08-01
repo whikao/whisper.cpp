@@ -769,13 +769,18 @@ jobs:
             cmake -S /tmp/spirv-headers -B /tmp/spirv-headers/build -DCMAKE_BUILD_TYPE=Release
             sudo cmake --install /tmp/spirv-headers/build
           fi
+          # 找出 config 的真实安装路径, 显式传给后面的 CMake 配置步骤
+          CFG_DIR=$(sudo find /usr /usr/local -name 'SPIRV-HeadersConfig.cmake' 2>/dev/null | head -1 | xargs dirname)
+          echo "SPIRV-Headers config dir: $CFG_DIR"
+          test -n "$CFG_DIR"
+          echo "SPIRV_HEADERS_DIR=$CFG_DIR" >> "$GITHUB_ENV"
 
       - name: 配置 CMake (启用 Hexagon 后端, v81 架构, 含测试程序)
         run: |
           mkdir -p build && cd build
           VULKAN_FLAG=""
           if [ "${{ inputs.patch_mode }}" = "hybrid" ]; then
-            VULKAN_FLAG="-DGGML_VULKAN=ON"
+            VULKAN_FLAG="-DGGML_VULKAN=ON -DSPIRV-Headers_DIR=${{ env.SPIRV_HEADERS_DIR }}"
             echo "=== hybrid 模式: Hexagon + Vulkan 双后端 ==="
           fi
           cmake .. \
