@@ -34,6 +34,7 @@ on:
           - gelusync
           - geluxact
           - rxfix
+          - gelucpu
         default: 'kernelfix'
         required: true
 
@@ -451,7 +452,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -860,7 +861,7 @@ jobs:
           grep -n -A 14 "SM8850 gelusync" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 打 geluxact 补丁 (DSP skel GELU 换成精确 erf, 弃用 sigmoid 近似)
-        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix'
+        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu'
         run: |
           python3 << 'EOF'
           upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
@@ -994,7 +995,7 @@ jobs:
           grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
 
       - name: "打 reorderfix 补丁 (Bug2 根治: 修 graph_optimize_reorder 不安全 matmul 堆叠 + GGML_HEXAGON_REORDER 开关)"
-        if: inputs.patch_mode == 'rxfix'
+        if: inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu'
         run: |
           python3 - << 'EOF'
           tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
@@ -1099,6 +1100,38 @@ jobs:
           EOF
           echo "=== rxfix 补丁验证 ==="
           grep -n "SM8850 rxfix" ggml/src/ggml-hexagon/ggml-hexagon.cpp
+
+      - name: "打 gelucpu 补丁 (Bug2 根治: GELU 默认不上 DSP, GGML_HEXAGON_GELU_DSP=1 可开)"
+        if: inputs.patch_mode == 'gelucpu'
+        run: |
+          python3 - << 'EOF'
+          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          tsrc = open(tpath).read()
+
+          # Bug2 终判: v3 q8 长解码链对 DSP GELU 与 CPU 的逐位差异混沌级敏感,
+          # 任何非逐位一致的 GELU (sigmoid 近似或 1e-7 级精确 erf) 都会在脆弱
+          # 窗口确定性触发循环; HVX 逐位复刻 CPU erff 不现实。
+          # 根治: GELU/GELU_QUICK 默认拒上 DSP (等效内建 OPFILTER='.*GELU.*'),
+          # turbo/fp16 已验证 DSP GELU 干净, 用 GGML_HEXAGON_GELU_DSP=1 显式开启。
+          g_old = ("                case GGML_UNARY_OP_GELU:\n"
+                   "                case GGML_UNARY_OP_GELU_QUICK:\n"
+                   "                    supp = ggml_hexagon_supported_unary(sess, op);\n"
+                   "                    break;")
+          g_new = ("                case GGML_UNARY_OP_GELU:\n"
+                   "                case GGML_UNARY_OP_GELU_QUICK:\n"
+                   "                    // SM8850 gelucpu: GELU defaults to CPU (Bug2);\n"
+                   "                    // GGML_HEXAGON_GELU_DSP=1 opts back into DSP GELU.\n"
+                   "                    supp = getenv(\"GGML_HEXAGON_GELU_DSP\") ?\n"
+                   "                           ggml_hexagon_supported_unary(sess, op) : false;\n"
+                   "                    break;")
+          assert tsrc.count(g_old) == 1, "gelucpu anchor (UNARY GELU case) 不唯一: %d" % tsrc.count(g_old)
+          tsrc = tsrc.replace(g_old, g_new)
+
+          open(tpath, "w").write(tsrc)
+          print("OK: gelucpu applied (GELU default->CPU, GGML_HEXAGON_GELU_DSP=1 opt-in)")
+          EOF
+          echo "=== gelucpu 补丁验证 ==="
+          grep -n -A 3 "SM8850 gelucpu" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 安装 glslc (hybrid 模式的 Vulkan shader 编译器)
         if: inputs.patch_mode == 'hybrid'
