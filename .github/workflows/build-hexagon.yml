@@ -33,6 +33,7 @@ on:
           - hybrid
           - gelusync
           - geluxact
+          - rxfix
         default: 'kernelfix'
         required: true
 
@@ -450,7 +451,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -859,7 +860,7 @@ jobs:
           grep -n -A 14 "SM8850 gelusync" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 打 geluxact 补丁 (DSP skel GELU 换成精确 erf, 弃用 sigmoid 近似)
-        if: inputs.patch_mode == 'geluxact'
+        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix'
         run: |
           python3 << 'EOF'
           upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
@@ -991,6 +992,113 @@ jobs:
           EOF
           echo "=== geluxact 补丁验证 ==="
           grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
+
+      - name: 打 reorderfix 补丁 (Bug2 根治: 修 graph_optimize_reorder 不安全 matmul 堆叠 + GGML_HEXAGON_REORDER 开关)
+        if: inputs.patch_mode == 'rxfix'
+        run: |
+          python3 - << 'EOF'
+          tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          tsrc = open(tpath).read()
+
+          # 1) 声明 opt_reorder
+          a1_old = "static int opt_opfusion = 1;    // enable/disable op fusion"
+          a1_new = a1_old + "\nstatic int opt_reorder  = 1;    // SM8850 rxfix: enable/disable matmul stacking reorder (GGML_HEXAGON_REORDER)"
+          assert tsrc.count(a1_old) == 1, "rxfix anchor-1 (opt decl) 不唯一"
+          tsrc = tsrc.replace(a1_old, a1_new)
+
+          # 2) 依赖安全检查函数 + 插入点
+          a2_old = ("    // Wait until all pending ops complete\n"
+                    "    sess->flush();\n"
+                    "\n"
+                    "    return GGML_STATUS_SUCCESS;\n"
+                    "}\n"
+                    "\n"
+                    "static void ggml_backend_hexagon_synchronize")
+          safe_fn = ("    // Wait until all pending ops complete\n"
+                    "    sess->flush();\n"
+                    "\n"
+                    "    return GGML_STATUS_SUCCESS;\n"
+                    "}\n"
+                    "\n"
+                    "// SM8850 rxfix: stacking node1 right after node0 is only safe if no node\n"
+                    "// between them reads node1's outputs (would run before its producer) or\n"
+                    "// produces any of node0/node1's inputs (stacked matmul reads stale data).\n"
+                    "static bool ggml_hexagon_reorder_stack_safe(const std::vector<htp_opnode> & nodes,\n"
+                    "                                            const std::vector<bool> & used,\n"
+                    "                                            int i0, int i1) {\n"
+                    "    const auto & node0 = nodes[i0];\n"
+                    "    const auto & node1 = nodes[i1];\n"
+                    "    const auto outs1 = node1.get_outputs();\n"
+                    "    const auto ins0  = node0.get_inputs();\n"
+                    "    const auto ins1  = node1.get_inputs();\n"
+                    "    for (int k = i0 + 1; k < i1; k++) {\n"
+                    "        if (used[k]) {\n"
+                    "            continue;\n"
+                    "        }\n"
+                    "        const auto mid_ins  = nodes[k].get_inputs();\n"
+                    "        const auto mid_outs = nodes[k].get_outputs();\n"
+                    "        for (const auto * x : mid_ins) {\n"
+                    "            for (const auto * o : outs1) {\n"
+                    "                if (x == o) return false;\n"
+                    "            }\n"
+                    "        }\n"
+                    "        for (const auto * x : mid_outs) {\n"
+                    "            for (const auto * in : ins0) {\n"
+                    "                if (x == in) return false;\n"
+                    "            }\n"
+                    "            for (const auto * in : ins1) {\n"
+                    "                if (x == in) return false;\n"
+                    "            }\n"
+                    "        }\n"
+                    "    }\n"
+                    "    return true;\n"
+                    "}\n"
+                    "\n"
+                    "static void ggml_backend_hexagon_synchronize")
+          assert tsrc.count(a2_old) == 1, "rxfix anchor-2 (insert safe fn) 不唯一"
+          tsrc = tsrc.replace(a2_old, safe_fn)
+
+          # 3) REORDER=0 整体禁用出口（身份序）
+          a3_old = "    std::vector<bool> used(n, false);\n"
+          a3_new = ("    std::vector<bool> used(n, false);\n"
+                    "\n"
+                    "    if (!opt_reorder) {\n"
+                    "        // SM8850 rxfix: GGML_HEXAGON_REORDER=0 -> identity order, no stacking (A/B debug)\n"
+                    "        for (int i = 0; i < n; i++) {\n"
+                    "            res.push_back(i);\n"
+                    "        }\n"
+                    "        return res;\n"
+                    "    }\n")
+          # a3 只应出现在 reorder 函数里
+          assert tsrc.count(a3_old) == 1, "rxfix anchor-3 (used decl) 不唯一: %d" % tsrc.count(a3_old)
+          tsrc = tsrc.replace(a3_old, a3_new)
+
+          # 4) 堆叠前加安全检查
+          a4_old = "            if (node1.stackable() && node1.same_input(node0)) {"
+          a4_new = ("            if (node1.stackable() && node1.same_input(node0)) {\n"
+                    "                if (!ggml_hexagon_reorder_stack_safe(nodes, used, i0, i1)) {\n"
+                    "                    continue; // SM8850 rxfix: unsafe stacking would execute node1 before a producer/consumer\n"
+                    "                }")
+          assert tsrc.count(a4_old) == 1, "rxfix anchor-4 (stackable check) 不唯一"
+          tsrc = tsrc.replace(a4_old, a4_new)
+
+          # 5) env 解析声明
+          a5_old = '    const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");'
+          a5_new = a5_old + '\n    const char * str_reorder  = getenv("GGML_HEXAGON_REORDER"); // SM8850 rxfix'
+          assert tsrc.count(a5_old) == 1, "rxfix anchor-5 (env decl) 不唯一"
+          tsrc = tsrc.replace(a5_old, a5_new)
+
+          # 6) env 解析赋值
+          a6_old = "    opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;"
+          a6_new = a6_old + "\n    opt_reorder   = str_reorder  ? atoi(str_reorder)                      : opt_reorder; // SM8850 rxfix"
+          assert tsrc.count(a6_old) >= 1, "rxfix anchor-6 (env assign) 未找到"
+          tsrc = tsrc.replace(a6_old, a6_new, 1)
+
+          open(tpath, "w").write(tsrc)
+          print("OK: rxfix applied (6 anchors)")
+          EOF
+          echo "=== rxfix 补丁验证 ==="
+          grep -n "SM8850 rxfix" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 安装 glslc (hybrid 模式的 Vulkan shader 编译器)
         if: inputs.patch_mode == 'hybrid'
