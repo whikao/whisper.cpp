@@ -1004,19 +1004,17 @@ jobs:
 
           # geluff: musl/Sun erff 完整移植到 HVX (替代 geluxact 的 A&S 7.1.26)。
           # 动机: Bug2 终判 = DSP GELU 与 CPU 非逐位一致 → v3 q8 深解码链放大 → 19:02 循环。
-          # geluxact (A&S 精确 erf, |eps|<=1.5e-7) 把触发面缩到 19:02 一点;
-          # geluff 用 CPU 同款 musl erff 算法 (含 Cody-Waite 高精度 exp), 敏感带误差 ~6e-8 (~1 ulp),
-          # 赌偏差再降一个量级可以把 19:02 推过混沌阈值。实验路线: 成功则 DSP GELU 全速回血,
-          # 失败则退回 gelucpu (GELU 默认 CPU)。float32 仿真: 敏感带 [-4,-1] 最大绝对误差 5.9e-8。
-          helper = r'''
-          // SM8850 geluff: musl/Sun erff ported to HVX (goal ~1 ulp GELU, Bug2 threshold probe).
-          // gelu(x) = x * 0.5 * (1 + erff(x/sqrt(2))), same rounding sequence as CPU musl erff:
-          //   |u| < 0.84375         : erf = u + u*pp(z2)/qq(z2), z2 = u*u
-          //   0.84375 <= |u| < 1.25 : erfc = (1-erx) - P/Q, s1 = |u|-1
-          //   1.25 <= |u|           : erfc = exp(-z*z-0.5625)*exp((z-|u|)(z+|u|)+R/S)/|u|
-          //                           z = |u| with low 13 mantissa bits cleared; ra/sa vs rb/sb at |u|=1/0.35
-          // exp: Cody-Waite reduction (ln2_hi/ln2_lo) + round-to-nearest + deg-7 Taylor (~1 ulp)
-          // div: a * (1/b), reciprocal = magic-seed + 3 Newton iterations (hvx_vec_inverse_f32)
+          # 常量化: 全部 fp32 系数放内存表 + 寄存器 vsplat, 避免大量立即数 constant-extender
+          # 包触发 hexagon-link relaxation 崩溃 (getOperand out of range); exp/gelu 函数 noinline。
+          # float32 仿真: 敏感带 [-4,-1] 最大绝对误差 5.9e-8 (~1 ulp)。
+          helper = r'''// SM8850 geluff: musl/Sun erff ported to HVX (goal ~1 ulp GELU, Bug2 threshold probe).
+          // All fp32/int constants live in a memory table + vsplat-from-register to avoid
+          // Hexagon immediate constant-extender packets (hexagon-link relaxation crashes
+          // with getOperand() out-of-range on functions with many ##imm splats).
+          enum { GF_LOG2E, GF_HALF, GF_LN2HI, GF_LN2LO, GF_EXPMAX, GF_EXPMIN, GF_E5, GF_E4, GF_E3, GF_E2, GF_E1, GF_ONE, GF_E0, GF_ERX, GF_INVSQ2, GF_PP4, GF_PP3, GF_PP2, GF_PP1, GF_PP0, GF_QQ5, GF_QQ4, GF_QQ3, GF_QQ2, GF_QQ1, GF_PA6, GF_PA5, GF_PA4, GF_PA3, GF_PA2, GF_PA1, GF_PA0, GF_QA6, GF_QA5, GF_QA4, GF_QA3, GF_QA2, GF_QA1, GF_RA7, GF_RA6, GF_RA5, GF_RA4, GF_RA3, GF_RA2, GF_RA1, GF_RA0, GF_SA8, GF_SA7, GF_SA6, GF_SA5, GF_SA4, GF_SA3, GF_SA2, GF_SA1, GF_RB6, GF_RB5, GF_RB4, GF_RB3, GF_RB2, GF_RB1, GF_RB0, GF_SB7, GF_SB6, GF_SB5, GF_SB4, GF_SB3, GF_SB2, GF_SB1, GF_THR3, GF_05625, GF_THR2, GF_THR1, GF_MASK13 };
+          static const int32_t hvx_gf_kbits[] __attribute__((aligned(128))) = { 0x3FB8AA3B, 0x3F000000, 0x3F317000, 0xB95E8083, 0x42B17218, 0xC2B00000, 0x39506967, 0x3AB743CE, 0x3C088908, 0x3D2AA9C1, 0x3E2AAAAA, 0x3F800000, 0x3F000000, 0x3F58560B, 0x3F3504F3, 0xB7C756B1, 0xBBBD1489, 0xBCE9528F, 0xBEA66BEB, 0x3E0375D4, 0xB684E21A, 0x390AEE49, 0x3BA68116, 0x3D852A63, 0x3ECBBBCE, 0xBB0DF9C0, 0x3D1151B3, 0xBDE31CC2, 0x3EA2FE54, 0xBEBE9208, 0x3ED46805, 0xBB1ACDC6, 0x3C445AA3, 0x3C5F6E13, 0x3E013307, 0x3D931AE7, 0x3F0A5785, 0x3DD9F331, 0xC11D077E, 0xC2A2932B, 0xC3389AE7, 0xC322658C, 0xC2798057, 0xC128F022, 0xBF31A0B7, 0xBC21A093, 0xBD777F97, 0x40D23F7C, 0x42D9451F, 0x43D6810B, 0x442158C9, 0x43D9486F, 0x4309A863, 0x419D35CE, 0xC3F1C275, 0xC480230B, 0xC41F6441, 0xC320A2EA, 0xC18E104B, 0xBF4C9DD4, 0xBC21A092, 0xC1B38712, 0x43ED43A7, 0x451F90CE, 0x4547FDBB, 0x44C01759, 0x43A2E571, 0x41F2B459, 0x4036DB6E, 0x3F100000, 0x3FA00000, 0x3F580000, 0xFFFFE000 };
+          #define HVX_GF_K(i) Q6_V_vsplat_R(hvx_gf_kbits[i])
+
           #define HVX_GF_MUL(a, b)    Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), Q6_V_vzero()))
           #define HVX_GF_FMA(a, b, c) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), c))
 
@@ -1025,27 +1023,23 @@ jobs:
           }
 
           static __attribute__((noinline)) HVX_Vector hvx_gf_exp_f32(HVX_Vector in_vec) {
-              const HVX_Vector log2e = Q6_V_vsplat_R(0x3FB8AA3B);  // log2(e) = 1.4426950408
-              const HVX_Vector half  = Q6_V_vsplat_R(0x3F000000);  // 0.5
-              const HVX_Vector c1    = Q6_V_vsplat_R(0x3F317000);  // ln2_hi = 0.693359375
-              const HVX_Vector c2    = Q6_V_vsplat_R(0xB95E8083);  // ln2_lo = -2.12194440e-4
               const HVX_Vector zero  = Q6_V_vzero();
 
               // clamp to (-88, 88) to avoid overflow/underflow
-              HVX_VectorPred pr = Q6_Q_vcmp_gt_VsfVsf(in_vec, Q6_V_vsplat_R(0x42B17218));
-              HVX_VectorPred pl = Q6_Q_vcmp_gt_VsfVsf(Q6_V_vsplat_R(0xC2B00000), in_vec);
-              in_vec = Q6_V_vmux_QVV(pr, Q6_V_vsplat_R(0x42B17218), in_vec);
-              in_vec = Q6_V_vmux_QVV(pl, Q6_V_vsplat_R(0xC2B00000), in_vec);
+              HVX_VectorPred pr = Q6_Q_vcmp_gt_VsfVsf(in_vec, HVX_GF_K(GF_EXPMAX));
+              HVX_VectorPred pl = Q6_Q_vcmp_gt_VsfVsf(HVX_GF_K(GF_EXPMIN), in_vec);
+              in_vec = Q6_V_vmux_QVV(pr, HVX_GF_K(GF_EXPMAX), in_vec);
+              in_vec = Q6_V_vmux_QVV(pl, HVX_GF_K(GF_EXPMIN), in_vec);
 
               // n = round(x/ln2) = floor(x*log2e + 0.5)
-              HVX_Vector t2  = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(log2e, in_vec), half));
+              HVX_Vector t2  = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(HVX_GF_K(GF_LOG2E), in_vec), HVX_GF_K(GF_HALF)));
               HVX_Vector f_v = hvx_vec_floor_f32(t2);
               HVX_Vector k_v = hvx_vec_truncate_f32(f_v);
 
               // Cody-Waite: g = x - n*ln2_hi - n*ln2_lo (ln2_lo is negative)
               HVX_Vector g_q = Q6_Vqf32_vadd_VsfVsf(in_vec, zero);
-              g_q = Q6_Vqf32_vsub_Vqf32Vqf32(g_q, Q6_Vqf32_vmpy_VsfVsf(f_v, c1));
-              g_q = Q6_Vqf32_vsub_Vqf32Vqf32(g_q, Q6_Vqf32_vmpy_VsfVsf(f_v, c2));
+              g_q = Q6_Vqf32_vsub_Vqf32Vqf32(g_q, Q6_Vqf32_vmpy_VsfVsf(f_v, HVX_GF_K(GF_LN2HI)));
+              g_q = Q6_Vqf32_vsub_Vqf32Vqf32(g_q, Q6_Vqf32_vmpy_VsfVsf(f_v, HVX_GF_K(GF_LN2LO)));
               g_q = Q6_Vqf32_vadd_Vqf32Vsf(g_q, zero);
               HVX_Vector g_v = Q6_Vsf_equals_Vqf32(g_q);
 
@@ -1053,25 +1047,25 @@ jobs:
               z_q = Q6_Vqf32_vadd_Vqf32Vsf(z_q, zero);
 
               // y = 1 + g + z*(E0 + g*(E1 + g*(E2 + g*(E3 + g*(E4 + g*E5))))), Ei = 1/(i+2)!
-              HVX_Vector y = Q6_Vqf32_vmpy_VsfVsf(Q6_V_vsplat_R(0x39506967), g_v);   // E5*g
-              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3AB743CE));              // +E4
+              HVX_Vector y = Q6_Vqf32_vmpy_VsfVsf(HVX_GF_K(GF_E5), g_v);             // E5*g
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, HVX_GF_K(GF_E4));                        // +E4
               y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
               y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
-              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3C088908));              // +E3
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, HVX_GF_K(GF_E3));                        // +E3
               y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
               y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
-              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3D2AA9C1));              // +E2
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, HVX_GF_K(GF_E2));                        // +E2
               y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
               y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
-              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3E2AAAAA));              // +E1
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, HVX_GF_K(GF_E1));                        // +E1
               y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
               y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
-              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3F000000));              // +E0
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, HVX_GF_K(GF_E0));                        // +E0
               y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
               y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, z_q);                                  // *z
               y = Q6_Vqf32_vadd_Vqf32Vqf32(y, g_q);                                  // +g
               y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
-              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3f800000));              // +1.0
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, HVX_GF_K(GF_ONE));                       // +1.0
               y = Q6_Vsf_equals_Vqf32(y);
 
               // y = ldexpf(y, k): add k to the exponent field
@@ -1083,90 +1077,88 @@ jobs:
               return Q6_V_vmux_QVV(q_under, zero, y);
           }
 
-
           static __attribute__((noinline)) HVX_Vector hvx_vec_gelu_musl_f32(HVX_Vector x) {
-              const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
-              const HVX_Vector half = hvx_vec_splat_f32(0.5f);
-              const HVX_Vector erx  = hvx_vec_splat_f32(8.4506291151e-01f);
-              const HVX_Vector u    = HVX_GF_MUL(x, hvx_vec_splat_f32(0.70710678f));
+              const HVX_Vector one  = HVX_GF_K(GF_ONE);
+              const HVX_Vector half = HVX_GF_K(GF_HALF);
+              const HVX_Vector u    = HVX_GF_MUL(x, HVX_GF_K(GF_INVSQ2));
               const HVX_Vector a    = hvx_vec_abs_f32(u);
               const HVX_VectorPred q_neg = Q6_Q_vcmp_gt_VsfVsf(Q6_V_vzero(), u);
 
               // ---- small: |u| < 0.84375, erf(u) = u + u*r/s (signed, odd function)
               const HVX_Vector z2 = HVX_GF_MUL(u, u);
-              HVX_Vector r = hvx_vec_splat_f32(-2.3763017452e-05f);   // pp4
-              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32(-5.7702702470e-03f));
-              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32(-2.8481749818e-02f));
-              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32(-3.2504209876e-01f));
-              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32( 1.2837916613e-01f)); // pp0
-              HVX_Vector s = hvx_vec_splat_f32(-3.9602282413e-06f);   // qq5
-              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 1.3249473704e-04f));
-              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 5.0813062117e-03f));
-              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 6.5022252500e-02f));
-              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 3.9791721106e-01f));
+              HVX_Vector r = HVX_GF_K(GF_PP4);
+              r = HVX_GF_FMA(z2, r, HVX_GF_K(GF_PP3));
+              r = HVX_GF_FMA(z2, r, HVX_GF_K(GF_PP2));
+              r = HVX_GF_FMA(z2, r, HVX_GF_K(GF_PP1));
+              r = HVX_GF_FMA(z2, r, HVX_GF_K(GF_PP0));
+              HVX_Vector s = HVX_GF_K(GF_QQ5);
+              s = HVX_GF_FMA(z2, s, HVX_GF_K(GF_QQ4));
+              s = HVX_GF_FMA(z2, s, HVX_GF_K(GF_QQ3));
+              s = HVX_GF_FMA(z2, s, HVX_GF_K(GF_QQ2));
+              s = HVX_GF_FMA(z2, s, HVX_GF_K(GF_QQ1));
               s = HVX_GF_FMA(z2, s, one);
               const HVX_Vector erf_small = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(HVX_GF_MUL(u, hvx_gf_div_f32(r, s)), u));
               const HVX_Vector h_small   = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, erf_small));
 
               // ---- mid: 0.84375 <= |u| < 1.25, erfc = (1-erx) - P/Q, s1 = |u|-1
               const HVX_Vector s1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(a, one));
-              HVX_Vector P = hvx_vec_splat_f32(-2.1663755178e-03f);   // pa6
-              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32( 3.5478305072e-02f));
-              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32(-1.1089469492e-01f));
-              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32( 3.1834661961e-01f));
-              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32(-3.7220788002e-01f));
-              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32( 4.1485610604e-01f));
-              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32(-2.3621185683e-03f)); // pa0
-              HVX_Vector Q = hvx_vec_splat_f32( 1.1984500103e-02f);   // qa6
-              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 1.3637083583e-02f));
-              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 1.2617121637e-01f));
-              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 7.1828655899e-02f));
-              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 5.4039794207e-01f));
-              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 1.0642088205e-01f));
+              HVX_Vector P = HVX_GF_K(GF_PA6);
+              P = HVX_GF_FMA(s1, P, HVX_GF_K(GF_PA5));
+              P = HVX_GF_FMA(s1, P, HVX_GF_K(GF_PA4));
+              P = HVX_GF_FMA(s1, P, HVX_GF_K(GF_PA3));
+              P = HVX_GF_FMA(s1, P, HVX_GF_K(GF_PA2));
+              P = HVX_GF_FMA(s1, P, HVX_GF_K(GF_PA1));
+              P = HVX_GF_FMA(s1, P, HVX_GF_K(GF_PA0));
+              HVX_Vector Q = HVX_GF_K(GF_QA6);
+              Q = HVX_GF_FMA(s1, Q, HVX_GF_K(GF_QA5));
+              Q = HVX_GF_FMA(s1, Q, HVX_GF_K(GF_QA4));
+              Q = HVX_GF_FMA(s1, Q, HVX_GF_K(GF_QA3));
+              Q = HVX_GF_FMA(s1, Q, HVX_GF_K(GF_QA2));
+              Q = HVX_GF_FMA(s1, Q, HVX_GF_K(GF_QA1));
               Q = HVX_GF_FMA(s1, Q, one);
               const HVX_Vector erfc_mid = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(
-                  Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, erx)), hvx_gf_div_f32(P, Q)));
+                  Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, HVX_GF_K(GF_ERX))), hvx_gf_div_f32(P, Q)));
 
               // ---- tail: |u| >= 1.25, erfc = exp(-z*z-0.5625)*exp((z-a)(z+a)+R/S)/a
               const HVX_Vector inv_aa = hvx_vec_inverse_f32(HVX_GF_MUL(a, a));   // 1/(a*a)
-              HVX_Vector Ra = hvx_vec_splat_f32(-9.8143291473e+00f);  // ra7
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-8.1287437439e+01f));
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-1.8460508728e+02f));
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-1.6239666748e+02f));
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-6.2375331879e+01f));
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-1.0558626175e+01f));
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-6.9385856390e-01f));
-              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-9.8649440333e-03f)); // ra0
-              HVX_Vector Sa = hvx_vec_splat_f32(-6.0424413532e-02f);  // sa8
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 6.5702495575e+00f));
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 1.0863500214e+02f));
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 4.2900814819e+02f));
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 6.4538726807e+02f));
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 4.3456588745e+02f));
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 1.3765776062e+02f));
-              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 1.9651271820e+01f));
+              HVX_Vector Ra = HVX_GF_K(GF_RA7);
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA6));
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA5));
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA4));
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA3));
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA2));
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA1));
+              Ra = HVX_GF_FMA(inv_aa, Ra, HVX_GF_K(GF_RA0));
+              HVX_Vector Sa = HVX_GF_K(GF_SA8);
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA7));
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA6));
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA5));
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA4));
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA3));
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA2));
+              Sa = HVX_GF_FMA(inv_aa, Sa, HVX_GF_K(GF_SA1));
               Sa = HVX_GF_FMA(inv_aa, Sa, one);
-              HVX_Vector Rb = hvx_vec_splat_f32(-4.8351919556e+02f);  // rb6
-              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-1.0250950928e+03f));
-              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-6.3756646729e+02f));
-              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-1.6063638306e+02f));
-              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-1.7757955551e+01f));
-              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-7.9928326607e-01f));
-              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-9.8649431020e-03f)); // rb0
-              HVX_Vector Sb = hvx_vec_splat_f32(-2.2440952301e+01f);  // sb7
-              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 4.7452853394e+02f));
-              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 2.5530502930e+03f));
-              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 3.1998581543e+03f));
-              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 1.5367296143e+03f));
-              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 3.2579251099e+02f));
-              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 3.0338060379e+01f));
+              HVX_Vector Rb = HVX_GF_K(GF_RB6);
+              Rb = HVX_GF_FMA(inv_aa, Rb, HVX_GF_K(GF_RB5));
+              Rb = HVX_GF_FMA(inv_aa, Rb, HVX_GF_K(GF_RB4));
+              Rb = HVX_GF_FMA(inv_aa, Rb, HVX_GF_K(GF_RB3));
+              Rb = HVX_GF_FMA(inv_aa, Rb, HVX_GF_K(GF_RB2));
+              Rb = HVX_GF_FMA(inv_aa, Rb, HVX_GF_K(GF_RB1));
+              Rb = HVX_GF_FMA(inv_aa, Rb, HVX_GF_K(GF_RB0));
+              HVX_Vector Sb = HVX_GF_K(GF_SB7);
+              Sb = HVX_GF_FMA(inv_aa, Sb, HVX_GF_K(GF_SB6));
+              Sb = HVX_GF_FMA(inv_aa, Sb, HVX_GF_K(GF_SB5));
+              Sb = HVX_GF_FMA(inv_aa, Sb, HVX_GF_K(GF_SB4));
+              Sb = HVX_GF_FMA(inv_aa, Sb, HVX_GF_K(GF_SB3));
+              Sb = HVX_GF_FMA(inv_aa, Sb, HVX_GF_K(GF_SB2));
+              Sb = HVX_GF_FMA(inv_aa, Sb, HVX_GF_K(GF_SB1));
               Sb = HVX_GF_FMA(inv_aa, Sb, one);
-              const HVX_VectorPred q_low = Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(2.8571428571f), a);  // a < 1/0.35
+              const HVX_VectorPred q_low = Q6_Q_vcmp_gt_VsfVsf(HVX_GF_K(GF_THR3), a);  // a < 1/0.35
               const HVX_Vector R = Q6_V_vmux_QVV(q_low, Ra, Rb);
               const HVX_Vector S = Q6_V_vmux_QVV(q_low, Sa, Sb);
-              const HVX_Vector z = Q6_V_vand_VV(a, Q6_V_vsplat_R(0xffffe000));  // pseudo-single precision
+              const HVX_Vector z = Q6_V_vand_VV(a, HVX_GF_K(GF_MASK13));  // pseudo-single precision
               const HVX_Vector arg1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(
-                  hvx_vec_neg_f32(HVX_GF_MUL(z, z)), hvx_vec_splat_f32(0.5625f)));
+                  hvx_vec_neg_f32(HVX_GF_MUL(z, z)), HVX_GF_K(GF_05625)));
               const HVX_Vector zma = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(z, a));
               const HVX_Vector zpa = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(z, a));
               const HVX_Vector arg2 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(
@@ -1176,12 +1168,12 @@ jobs:
 
               // y = 1 - erfc = |erf(u)| (same rounding sequence as musl erff); h = 1 + erf(u)
               const HVX_Vector erfc_v = Q6_V_vmux_QVV(
-                  Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(1.25f), a), erfc_mid, erfc_tail);
+                  Q6_Q_vcmp_gt_VsfVsf(HVX_GF_K(GF_THR2), a), erfc_mid, erfc_tail);
               const HVX_Vector y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, erfc_v));
               const HVX_Vector h_ge = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one,
                   Q6_V_vmux_QVV(q_neg, hvx_vec_neg_f32(y), y)));
               const HVX_Vector h = Q6_V_vmux_QVV(
-                  Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(0.84375f), a), h_small, h_ge);
+                  Q6_Q_vcmp_gt_VsfVsf(HVX_GF_K(GF_THR1), a), h_small, h_ge);
 
               return HVX_GF_MUL(x, HVX_GF_MUL(half, h));
           }
