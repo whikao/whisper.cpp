@@ -35,6 +35,7 @@ on:
           - geluxact
           - rxfix
           - gelucpu
+          - geluff
         default: 'kernelfix'
         required: true
 
@@ -452,7 +453,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu", "geluff"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -993,6 +994,276 @@ jobs:
           EOF
           echo "=== geluxact 补丁验证 ==="
           grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
+
+      - name: "打 geluff 补丁 (实验: DSP GELU 换 musl/Sun erff HVX 移植, 目标 ~1 ulp, 攻 Bug2 循环阈值)"
+        if: inputs.patch_mode == 'geluff'
+        run: |
+          python3 << 'EOF'
+          upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
+          usrc = open(upath).read()
+
+          # geluff: musl/Sun erff 完整移植到 HVX (替代 geluxact 的 A&S 7.1.26)。
+          # 动机: Bug2 终判 = DSP GELU 与 CPU 非逐位一致 → v3 q8 深解码链放大 → 19:02 循环。
+          # geluxact (A&S 精确 erf, |eps|<=1.5e-7) 把触发面缩到 19:02 一点;
+          # geluff 用 CPU 同款 musl erff 算法 (含 Cody-Waite 高精度 exp), 敏感带误差 ~6e-8 (~1 ulp),
+          # 赌偏差再降一个量级可以把 19:02 推过混沌阈值。实验路线: 成功则 DSP GELU 全速回血,
+          # 失败则退回 gelucpu (GELU 默认 CPU)。float32 仿真: 敏感带 [-4,-1] 最大绝对误差 5.9e-8。
+          helper = r'''
+          // SM8850 geluff: musl/Sun erff ported to HVX (goal ~1 ulp GELU, Bug2 threshold probe).
+          // gelu(x) = x * 0.5 * (1 + erff(x/sqrt(2))), same rounding sequence as CPU musl erff:
+          //   |u| < 0.84375         : erf = u + u*pp(z2)/qq(z2), z2 = u*u
+          //   0.84375 <= |u| < 1.25 : erfc = (1-erx) - P/Q, s1 = |u|-1
+          //   1.25 <= |u|           : erfc = exp(-z*z-0.5625)*exp((z-|u|)(z+|u|)+R/S)/|u|
+          //                           z = |u| with low 13 mantissa bits cleared; ra/sa vs rb/sb at |u|=1/0.35
+          // exp: Cody-Waite reduction (ln2_hi/ln2_lo) + round-to-nearest + deg-7 Taylor (~1 ulp)
+          // div: a * (1/b), reciprocal = magic-seed + 3 Newton iterations (hvx_vec_inverse_f32)
+          #define HVX_GF_MUL(a, b)    Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), Q6_V_vzero()))
+          #define HVX_GF_FMA(a, b, c) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), c))
+
+          static inline HVX_Vector hvx_gf_div_f32(HVX_Vector a, HVX_Vector b) {
+              return HVX_GF_MUL(a, hvx_vec_inverse_f32(b));
+          }
+
+          static inline HVX_Vector hvx_gf_exp_f32(HVX_Vector in_vec) {
+              const HVX_Vector log2e = Q6_V_vsplat_R(0x3FB8AA3B);  // log2(e) = 1.4426950408
+              const HVX_Vector half  = Q6_V_vsplat_R(0x3F000000);  // 0.5
+              const HVX_Vector c1    = Q6_V_vsplat_R(0x3F317000);  // ln2_hi = 0.693359375
+              const HVX_Vector c2    = Q6_V_vsplat_R(0xB95E8083);  // ln2_lo = -2.12194440e-4
+              const HVX_Vector zero  = Q6_V_vzero();
+
+              // clamp to (-88, 88) to avoid overflow/underflow
+              HVX_VectorPred pr = Q6_Q_vcmp_gt_VsfVsf(in_vec, Q6_V_vsplat_R(0x42B17218));
+              HVX_VectorPred pl = Q6_Q_vcmp_gt_VsfVsf(Q6_V_vsplat_R(0xC2B00000), in_vec);
+              in_vec = Q6_V_vmux_QVV(pr, Q6_V_vsplat_R(0x42B17218), in_vec);
+              in_vec = Q6_V_vmux_QVV(pl, Q6_V_vsplat_R(0xC2B00000), in_vec);
+
+              // n = round(x/ln2) = floor(x*log2e + 0.5)
+              HVX_Vector t2  = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(log2e, in_vec), half));
+              HVX_Vector f_v = hvx_vec_floor_f32(t2);
+              HVX_Vector k_v = hvx_vec_truncate_f32(f_v);
+
+              // Cody-Waite: g = x - n*ln2_hi - n*ln2_lo (ln2_lo is negative)
+              HVX_Vector g_q = Q6_Vqf32_vadd_VsfVsf(in_vec, zero);
+              g_q = Q6_Vqf32_vsub_Vqf32Vqf32(g_q, Q6_Vqf32_vmpy_VsfVsf(f_v, c1));
+              g_q = Q6_Vqf32_vsub_Vqf32Vqf32(g_q, Q6_Vqf32_vmpy_VsfVsf(f_v, c2));
+              g_q = Q6_Vqf32_vadd_Vqf32Vsf(g_q, zero);
+              HVX_Vector g_v = Q6_Vsf_equals_Vqf32(g_q);
+
+              HVX_Vector z_q = Q6_Vqf32_vmpy_Vqf32Vqf32(g_q, g_q);
+              z_q = Q6_Vqf32_vadd_Vqf32Vsf(z_q, zero);
+
+              // y = 1 + g + z*(E0 + g*(E1 + g*(E2 + g*(E3 + g*(E4 + g*E5))))), Ei = 1/(i+2)!
+              HVX_Vector y = Q6_Vqf32_vmpy_VsfVsf(Q6_V_vsplat_R(0x39506967), g_v);   // E5*g
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3AB743CE));              // +E4
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
+              y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3C088908));              // +E3
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
+              y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3D2AA9C1));              // +E2
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
+              y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3E2AAAAA));              // +E1
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
+              y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, g_q);
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3F000000));              // +E0
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
+              y = Q6_Vqf32_vmpy_Vqf32Vqf32(y, z_q);                                  // *z
+              y = Q6_Vqf32_vadd_Vqf32Vqf32(y, g_q);                                  // +g
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, zero);
+              y = Q6_Vqf32_vadd_Vqf32Vsf(y, Q6_V_vsplat_R(0x3f800000));              // +1.0
+              y = Q6_Vsf_equals_Vqf32(y);
+
+              // y = ldexpf(y, k): add k to the exponent field
+              HVX_Vector y_exp = Q6_Vw_vasl_VwR(y, 1);
+              y_exp = Q6_Vuw_vlsr_VuwR(y_exp, IEEE_VSF_MANTLEN + 1);
+              y_exp = Q6_Vw_vadd_VwVw(k_v, y_exp);
+              HVX_VectorPred q_under = Q6_Q_vcmp_gt_VwVw(zero, y_exp);
+              y = Q6_Vw_vaslacc_VwVwR(y, k_v, IEEE_VSF_MANTLEN);
+              return Q6_V_vmux_QVV(q_under, zero, y);
+          }
+
+
+          static inline HVX_Vector hvx_vec_gelu_musl_f32(HVX_Vector x) {
+              const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
+              const HVX_Vector half = hvx_vec_splat_f32(0.5f);
+              const HVX_Vector erx  = hvx_vec_splat_f32(8.4506291151e-01f);
+              const HVX_Vector u    = HVX_GF_MUL(x, hvx_vec_splat_f32(0.70710678f));
+              const HVX_Vector a    = hvx_vec_abs_f32(u);
+              const HVX_VectorPred q_neg = Q6_Q_vcmp_gt_VsfVsf(Q6_V_vzero(), u);
+
+              // ---- small: |u| < 0.84375, erf(u) = u + u*r/s (signed, odd function)
+              const HVX_Vector z2 = HVX_GF_MUL(u, u);
+              HVX_Vector r = hvx_vec_splat_f32(-2.3763017452e-05f);   // pp4
+              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32(-5.7702702470e-03f));
+              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32(-2.8481749818e-02f));
+              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32(-3.2504209876e-01f));
+              r = HVX_GF_FMA(z2, r, hvx_vec_splat_f32( 1.2837916613e-01f)); // pp0
+              HVX_Vector s = hvx_vec_splat_f32(-3.9602282413e-06f);   // qq5
+              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 1.3249473704e-04f));
+              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 5.0813062117e-03f));
+              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 6.5022252500e-02f));
+              s = HVX_GF_FMA(z2, s, hvx_vec_splat_f32( 3.9791721106e-01f));
+              s = HVX_GF_FMA(z2, s, one);
+              const HVX_Vector erf_small = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(HVX_GF_MUL(u, hvx_gf_div_f32(r, s)), u));
+              const HVX_Vector h_small   = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, erf_small));
+
+              // ---- mid: 0.84375 <= |u| < 1.25, erfc = (1-erx) - P/Q, s1 = |u|-1
+              const HVX_Vector s1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(a, one));
+              HVX_Vector P = hvx_vec_splat_f32(-2.1663755178e-03f);   // pa6
+              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32( 3.5478305072e-02f));
+              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32(-1.1089469492e-01f));
+              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32( 3.1834661961e-01f));
+              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32(-3.7220788002e-01f));
+              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32( 4.1485610604e-01f));
+              P = HVX_GF_FMA(s1, P, hvx_vec_splat_f32(-2.3621185683e-03f)); // pa0
+              HVX_Vector Q = hvx_vec_splat_f32( 1.1984500103e-02f);   // qa6
+              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 1.3637083583e-02f));
+              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 1.2617121637e-01f));
+              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 7.1828655899e-02f));
+              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 5.4039794207e-01f));
+              Q = HVX_GF_FMA(s1, Q, hvx_vec_splat_f32( 1.0642088205e-01f));
+              Q = HVX_GF_FMA(s1, Q, one);
+              const HVX_Vector erfc_mid = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(
+                  Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, erx)), hvx_gf_div_f32(P, Q)));
+
+              // ---- tail: |u| >= 1.25, erfc = exp(-z*z-0.5625)*exp((z-a)(z+a)+R/S)/a
+              const HVX_Vector inv_aa = hvx_vec_inverse_f32(HVX_GF_MUL(a, a));   // 1/(a*a)
+              HVX_Vector Ra = hvx_vec_splat_f32(-9.8143291473e+00f);  // ra7
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-8.1287437439e+01f));
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-1.8460508728e+02f));
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-1.6239666748e+02f));
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-6.2375331879e+01f));
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-1.0558626175e+01f));
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-6.9385856390e-01f));
+              Ra = HVX_GF_FMA(inv_aa, Ra, hvx_vec_splat_f32(-9.8649440333e-03f)); // ra0
+              HVX_Vector Sa = hvx_vec_splat_f32(-6.0424413532e-02f);  // sa8
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 6.5702495575e+00f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 1.0863500214e+02f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 4.2900814819e+02f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 6.4538726807e+02f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 4.3456588745e+02f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 1.3765776062e+02f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, hvx_vec_splat_f32( 1.9651271820e+01f));
+              Sa = HVX_GF_FMA(inv_aa, Sa, one);
+              HVX_Vector Rb = hvx_vec_splat_f32(-4.8351919556e+02f);  // rb6
+              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-1.0250950928e+03f));
+              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-6.3756646729e+02f));
+              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-1.6063638306e+02f));
+              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-1.7757955551e+01f));
+              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-7.9928326607e-01f));
+              Rb = HVX_GF_FMA(inv_aa, Rb, hvx_vec_splat_f32(-9.8649431020e-03f)); // rb0
+              HVX_Vector Sb = hvx_vec_splat_f32(-2.2440952301e+01f);  // sb7
+              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 4.7452853394e+02f));
+              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 2.5530502930e+03f));
+              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 3.1998581543e+03f));
+              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 1.5367296143e+03f));
+              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 3.2579251099e+02f));
+              Sb = HVX_GF_FMA(inv_aa, Sb, hvx_vec_splat_f32( 3.0338060379e+01f));
+              Sb = HVX_GF_FMA(inv_aa, Sb, one);
+              const HVX_VectorPred q_low = Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(2.8571428571f), a);  // a < 1/0.35
+              const HVX_Vector R = Q6_V_vmux_QVV(q_low, Ra, Rb);
+              const HVX_Vector S = Q6_V_vmux_QVV(q_low, Sa, Sb);
+              const HVX_Vector z = Q6_V_vand_VV(a, Q6_V_vsplat_R(0xffffe000));  // pseudo-single precision
+              const HVX_Vector arg1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(
+                  hvx_vec_neg_f32(HVX_GF_MUL(z, z)), hvx_vec_splat_f32(0.5625f)));
+              const HVX_Vector zma = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(z, a));
+              const HVX_Vector zpa = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(z, a));
+              const HVX_Vector arg2 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(
+                  Q6_Vqf32_vmpy_VsfVsf(zma, zpa), hvx_gf_div_f32(R, S)));
+              const HVX_Vector erfc_tail = hvx_gf_div_f32(
+                  HVX_GF_MUL(hvx_gf_exp_f32(arg1), hvx_gf_exp_f32(arg2)), a);
+
+              // y = 1 - erfc = |erf(u)| (same rounding sequence as musl erff); h = 1 + erf(u)
+              const HVX_Vector erfc_v = Q6_V_vmux_QVV(
+                  Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(1.25f), a), erfc_mid, erfc_tail);
+              const HVX_Vector y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, erfc_v));
+              const HVX_Vector h_ge = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one,
+                  Q6_V_vmux_QVV(q_neg, hvx_vec_neg_f32(y), y)));
+              const HVX_Vector h = Q6_V_vmux_QVV(
+                  Q6_Q_vcmp_gt_VsfVsf(hvx_vec_splat_f32(0.84375f), a), h_small, h_ge);
+
+              return HVX_GF_MUL(x, HVX_GF_MUL(half, h));
+          }
+
+          #define hvx_gelu_musl_loop_body(dst_type, src_type, vec_store)         \
+              do {                                                               \
+                  dst_type * restrict vdst = (dst_type *) dst;                   \
+                  src_type * restrict vsrc = (src_type *) src;                   \
+                                                                                 \
+                  const uint32_t epv  = 128 / sizeof(float);                     \
+                  const uint32_t nvec = n / epv;                                 \
+                  const uint32_t nloe = n % epv;                                 \
+                                                                                 \
+                  uint32_t i = 0;                                                \
+                                                                                 \
+                  _Pragma("unroll(4)")                                           \
+                  for (; i < nvec; i++) {                                        \
+                       vdst[i] = hvx_vec_gelu_musl_f32(vsrc[i]);                 \
+                  }                                                              \
+                  if (nloe) {                                                    \
+                       HVX_Vector tmp = hvx_vec_gelu_musl_f32(vsrc[i]);          \
+                       vec_store((void *) &vdst[i], nloe * sizeof(float), tmp);  \
+                  }                                                              \
+              } while(0)
+
+          static inline void hvx_gelu_musl_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+              hvx_gelu_musl_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+          }
+          '''
+
+          g1_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_mul_scalar_f32(dst_local, src_local, 1.702f, ne0);
+                  hvx_sigmoid_f32_aa(dst_local, dst_local, ne0);
+                  hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
+              }
+          }'''
+          g1_new = helper + '''
+          // gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (musl/Sun erff HVX port, matches CPU musl erff ~1 ulp)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_gelu_musl_f32_aa(dst_local, src_local, ne0);
+              }
+          }'''
+          assert usrc.count(g1_old) == 1, "geluff anchor-1 (gelu_f32) 不唯一: %d" % usrc.count(g1_old)
+          usrc = usrc.replace(g1_old, g1_new)
+
+          g2_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_mul_scalar_f32(dst_vtcm, src_vtcm, 1.702f, tw);
+              hvx_sigmoid_f32_aa(dst_vtcm, dst_vtcm, tw);
+              hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+          }'''
+          g2_new = '''// gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (musl/Sun erff HVX port, matches CPU musl erff ~1 ulp)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_gelu_musl_f32_aa(dst_vtcm, src_vtcm, tw);
+          }'''
+          assert usrc.count(g2_old) == 1, "geluff anchor-2 (tile_gelu_f32) 不唯一: %d" % usrc.count(g2_old)
+          usrc = usrc.replace(g2_old, g2_new)
+
+          open(upath, "w").write(usrc)
+          print("OK: geluff applied (gelu_f32 + tile_gelu_f32 -> musl/Sun erff HVX)")
+          EOF
+          echo "=== geluff 补丁验证 ==="
+          grep -n "geluff\|hvx_gelu_musl_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
 
       - name: "打 reorderfix 补丁 (Bug2 根治: 修 graph_optimize_reorder 不安全 matmul 堆叠 + GGML_HEXAGON_REORDER 开关)"
         if: inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu'
