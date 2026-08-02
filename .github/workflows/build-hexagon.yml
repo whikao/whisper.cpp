@@ -36,6 +36,7 @@ on:
           - rxfix
           - gelucpu
           - geluff
+          - htpcool
         default: 'kernelfix'
         required: true
 
@@ -453,7 +454,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu", "geluff"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu", "geluff", "htpcool"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -862,7 +863,7 @@ jobs:
           grep -n -A 14 "SM8850 gelusync" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 打 geluxact 补丁 (DSP skel GELU 换成精确 erf, 弃用 sigmoid 近似)
-        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu'
+        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu' || inputs.patch_mode == 'htpcool'
         run: |
           python3 << 'EOF'
           upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
@@ -994,6 +995,178 @@ jobs:
           EOF
           echo "=== geluxact 补丁验证 ==="
           grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
+
+      - name: "打 htpcool 补丁 (降温: GGML_HEXAGON_HTPPERF 六档 DCVS/HMX corner 预设, 默认不加 env 保持满血)"
+        if: inputs.patch_mode == 'htpcool'
+        run: |
+          python3 << 'EOF'
+          import sys
+
+          # --- 1. IDL: new RPC set_perf(level) ---
+          ipath = "ggml/src/ggml-hexagon/htp/htp_iface.idl"
+          isrc = open(ipath).read()
+          i_old = "    AEEResult etm(in uint32 enable);"
+          i_new = "    AEEResult etm(in uint32 enable);\n    AEEResult set_perf(in uint32 level);"
+          assert isrc.count(i_old) == 1, "htpcool IDL anchor 不唯一"
+          open(ipath, "w").write(isrc.replace(i_old, i_new))
+
+          # --- 2. skel main.c: htp_iface_set_perf implementation (DCVS/HMX corner re-vote) ---
+          mpath = "ggml/src/ggml-hexagon/htp/main.c"
+          msrc = open(mpath).read()
+          m_old = "AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp_queue_id, uint32_t n_hvx, uint32_t n_hmx, uint64_t max_vmem) {"
+          assert msrc.count(m_old) == 1, "htpcool skel anchor 不唯一"
+          impl = r'''
+          // SM8850 htpcool: runtime HTP perf presets (ORT/QNN style), re-vote DCVS/HMX corners.
+          // level: 0=low_power_saver 1=power_saver 2=balanced 3=high_performance
+          //        4=sustained_high_performance 5=burst (upstream default)
+          AEEResult htp_iface_set_perf(remote_handle64 handle, uint32_t level) {
+              struct htp_handle * h = (struct htp_handle *) handle;
+              if (!h || !h->ctx) {
+                  return AEE_EBADSTATE;
+              }
+              struct htp_context * ctx = h->ctx;
+
+              struct perf_preset {
+                  int dcvs_enable;
+                  int sleep_disable;
+                  int core_min, core_target, core_max;
+                  int bus_min,  bus_target,  bus_max;
+                  int hmx_corner;
+                  int hmx_perf_mode;
+              };
+
+              static const struct perf_preset presets[6] = {
+                  // 0 low_power_saver: DCVS on, everything pinned low, sleep allowed
+                  { TRUE, FALSE,
+                    HAP_DCVS_VCORNER_SVS2, HAP_DCVS_VCORNER_SVS,      HAP_DCVS_VCORNER_SVS,
+                    HAP_DCVS_VCORNER_SVS2, HAP_DCVS_VCORNER_SVS,      HAP_DCVS_VCORNER_SVS,
+                    HAP_DCVS_EXP_VCORNER_LOW_SVS, HAP_CLK_PERF_LOW },
+                  // 1 power_saver
+                  { TRUE, FALSE,
+                    HAP_DCVS_VCORNER_SVS2, HAP_DCVS_VCORNER_SVS_PLUS, HAP_DCVS_VCORNER_SVS_PLUS,
+                    HAP_DCVS_VCORNER_SVS2, HAP_DCVS_VCORNER_SVS_PLUS, HAP_DCVS_VCORNER_SVS_PLUS,
+                    HAP_DCVS_EXP_VCORNER_SVS,     HAP_CLK_PERF_LOW },
+                  // 2 balanced
+                  { TRUE, FALSE,
+                    HAP_DCVS_VCORNER_SVS,  HAP_DCVS_VCORNER_NOM,      HAP_DCVS_VCORNER_NOM,
+                    HAP_DCVS_VCORNER_SVS,  HAP_DCVS_VCORNER_NOM,      HAP_DCVS_VCORNER_NOM,
+                    HAP_DCVS_EXP_VCORNER_NOM,     HAP_CLK_PERF_HIGH },
+                  // 3 high_performance
+                  { TRUE, FALSE,
+                    HAP_DCVS_VCORNER_NOM,  HAP_DCVS_VCORNER_TURBO,    HAP_DCVS_VCORNER_TURBO,
+                    HAP_DCVS_VCORNER_NOM,  HAP_DCVS_VCORNER_TURBO,    HAP_DCVS_VCORNER_TURBO,
+                    HAP_DCVS_EXP_VCORNER_TUR,     HAP_CLK_PERF_HIGH },
+                  // 4 sustained_high_performance
+                  { TRUE, TRUE,
+                    HAP_DCVS_VCORNER_NOM,  HAP_DCVS_VCORNER_TURBO_PLUS, HAP_DCVS_VCORNER_TURBO_L2,
+                    HAP_DCVS_VCORNER_NOM,  HAP_DCVS_VCORNER_TURBO_PLUS, HAP_DCVS_VCORNER_TURBO_L2,
+                    HAP_DCVS_EXP_VCORNER_TUR_L1,  HAP_CLK_PERF_HIGH },
+                  // 5 burst = upstream default (DCVS off, all MAX, no sleep)
+                  { FALSE, TRUE,
+                    HAP_DCVS_VCORNER_MAX,  HAP_DCVS_VCORNER_MAX,      HAP_DCVS_VCORNER_MAX,
+                    HAP_DCVS_VCORNER_MAX,  HAP_DCVS_VCORNER_MAX,      HAP_DCVS_VCORNER_MAX,
+                    HAP_DCVS_EXP_VCORNER_MAX,     HAP_CLK_PERF_HIGH },
+              };
+
+              if (level > 5) {
+                  return AEE_EBADPARM;
+              }
+              const struct perf_preset * p = &presets[level];
+
+              HAP_power_request_t request;
+              memset(&request, 0, sizeof(request));
+              request.type                              = HAP_power_set_DCVS_v3;
+              request.dcvs_v3.set_dcvs_enable           = TRUE;
+              request.dcvs_v3.dcvs_enable               = p->dcvs_enable;
+              request.dcvs_v3.set_bus_params            = TRUE;
+              request.dcvs_v3.bus_params.min_corner     = p->bus_min;
+              request.dcvs_v3.bus_params.max_corner     = p->bus_max;
+              request.dcvs_v3.bus_params.target_corner  = p->bus_target;
+              request.dcvs_v3.set_core_params           = TRUE;
+              request.dcvs_v3.core_params.min_corner    = p->core_min;
+              request.dcvs_v3.core_params.max_corner    = p->core_max;
+              request.dcvs_v3.core_params.target_corner = p->core_target;
+              request.dcvs_v3.set_sleep_disable         = TRUE;
+              request.dcvs_v3.sleep_disable             = p->sleep_disable;
+
+          #if (__HEXAGON_ARCH__ >= 79)
+              HAP_set_dcvs_v3_protected_bus_corners(&request, 1);
+          #endif
+              int err = HAP_power_set((void *) ctx, &request);
+              if (err != AEE_SUCCESS) {
+                  FARF(ERROR, "htpcool: DCVS vote failed for level %u (0x%08x)", (unsigned) level, (unsigned) err);
+                  return err;
+              }
+
+          #if __HVX_ARCH__ >= 75
+              // re-vote HMX corner
+              memset(&request, 0, sizeof(request));
+              request.type = HAP_power_set_HMX_v2;
+              request.hmx_v2.set_power     = TRUE;
+              request.hmx_v2.power_up      = TRUE;
+              request.hmx_v2.set_clock     = TRUE;
+              request.hmx_v2.target_corner = p->hmx_corner;
+              request.hmx_v2.min_corner    = p->hmx_corner;
+              request.hmx_v2.max_corner    = p->hmx_corner;
+              request.hmx_v2.perf_mode     = p->hmx_perf_mode;
+              err = HAP_power_set((void *) ctx, &request);
+              if (err != AEE_SUCCESS) {
+                  FARF(ERROR, "htpcool: HMX vote failed for level %u (0x%08x)", (unsigned) level, (unsigned) err);
+                  return err;
+              }
+          #endif
+
+              FARF(HIGH, "htpcool: perf level %u applied", (unsigned) level);
+              return AEE_SUCCESS;
+          }
+
+          '''
+          open(mpath, "w").write(msrc.replace(m_old, impl + m_old))
+
+          # --- 3. host ggml-hexagon.cpp: GGML_HEXAGON_HTPPERF env -> htp_iface_set_perf ---
+          hpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
+          hsrc = open(hpath).read()
+          h_old = "    this->valid_iface = true;"
+          assert hsrc.count(h_old) == 1, "htpcool host anchor 不唯一"
+          call = r'''
+              // SM8850 htpcool: runtime HTP perf preset via GGML_HEXAGON_HTPPERF
+              // (0-5 or low_power_saver|power_saver|balanced|high_performance|sustained_high_performance|burst)
+              {
+                  const char * str_perf = getenv("GGML_HEXAGON_HTPPERF");
+                  if (str_perf && str_perf[0]) {
+                      static const char * perf_names[6] = { "low_power_saver", "power_saver", "balanced",
+                                                            "high_performance", "sustained_high_performance", "burst" };
+                      int level = -1;
+                      for (int i = 0; i < 6; i++) {
+                          if (0 == strcmp(str_perf, perf_names[i])) {
+                              level = i;
+                              break;
+                          }
+                      }
+                      if (level < 0 && str_perf[0] >= '0' && str_perf[0] <= '5' && str_perf[1] == 0) {
+                          level = str_perf[0] - '0';
+                      }
+                      if (level >= 0) {
+                          int perr = htp_iface_set_perf(this->handle, (uint32_t) level);
+                          if (perr != 0) {
+                              GGML_LOG_ERROR("ggml-hex: %s htpcool set_perf(%s) failed: 0x%08x\n", this->c_name(), str_perf, (unsigned) perr);
+                          } else {
+                              GGML_LOG_INFO("ggml-hex: %s htpcool perf level %d (%s)\n", this->c_name(), level, perf_names[level]);
+                          }
+                      } else {
+                          GGML_LOG_ERROR("ggml-hex: %s htpcool unknown GGML_HEXAGON_HTPPERF '%s' (0-5 or preset name)\n", this->c_name(), str_perf);
+                      }
+                  }
+              }
+          '''
+          open(hpath, "w").write(hsrc.replace(h_old, h_old + "\n" + call))
+
+          print("OK: htpcool applied (IDL + skel set_perf + host env hook)")
+          EOF
+          echo "=== htpcool 补丁验证 ==="
+          grep -n "set_perf" ggml/src/ggml-hexagon/htp/htp_iface.idl
+          grep -n "htp_iface_set_perf" ggml/src/ggml-hexagon/htp/main.c ggml/src/ggml-hexagon/ggml-hexagon.cpp
+          grep -n "HTPPERF" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: "打 geluff 补丁 (实验: DSP GELU 换 musl/Sun erff HVX 移植, 目标 ~1 ulp, 攻 Bug2 循环阈值)"
         if: inputs.patch_mode == 'geluff'
@@ -1258,7 +1431,7 @@ jobs:
           grep -n "geluff\|hvx_gelu_musl_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
 
       - name: "打 reorderfix 补丁 (Bug2 根治: 修 graph_optimize_reorder 不安全 matmul 堆叠 + GGML_HEXAGON_REORDER 开关)"
-        if: inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu'
+        if: inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu' || inputs.patch_mode == 'htpcool'
         run: |
           python3 - << 'EOF'
           tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
@@ -1365,7 +1538,7 @@ jobs:
           grep -n "SM8850 rxfix" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: "打 gelucpu 补丁 (Bug2 根治: GELU 默认不上 DSP, GGML_HEXAGON_GELU_DSP=1 可开)"
-        if: inputs.patch_mode == 'gelucpu'
+        if: inputs.patch_mode == 'gelucpu' || inputs.patch_mode == 'htpcool'
         run: |
           python3 - << 'EOF'
           tpath = "ggml/src/ggml-hexagon/ggml-hexagon.cpp"
