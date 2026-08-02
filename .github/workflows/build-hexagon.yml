@@ -1024,7 +1024,7 @@ jobs:
               return HVX_GF_MUL(a, hvx_vec_inverse_f32(b));
           }
 
-          static inline HVX_Vector hvx_gf_exp_f32(HVX_Vector in_vec) {
+          static __attribute__((noinline)) HVX_Vector hvx_gf_exp_f32(HVX_Vector in_vec) {
               const HVX_Vector log2e = Q6_V_vsplat_R(0x3FB8AA3B);  // log2(e) = 1.4426950408
               const HVX_Vector half  = Q6_V_vsplat_R(0x3F000000);  // 0.5
               const HVX_Vector c1    = Q6_V_vsplat_R(0x3F317000);  // ln2_hi = 0.693359375
@@ -1084,7 +1084,7 @@ jobs:
           }
 
 
-          static inline HVX_Vector hvx_vec_gelu_musl_f32(HVX_Vector x) {
+          static __attribute__((noinline)) HVX_Vector hvx_vec_gelu_musl_f32(HVX_Vector x) {
               const HVX_Vector one  = hvx_vec_splat_f32(1.0f);
               const HVX_Vector half = hvx_vec_splat_f32(0.5f);
               const HVX_Vector erx  = hvx_vec_splat_f32(8.4506291151e-01f);
