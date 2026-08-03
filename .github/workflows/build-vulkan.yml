@@ -37,6 +37,113 @@ jobs:
           git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
           ls Vulkan-Headers/include/vulkan/vulkan.hpp
 
+      # 【SM8850 queue priority 补丁】在编译之前打。找不到锚点会显式报错（防止白编）
+      - name: 打 queue-priority 补丁 (VK_KHR_global_priority, GGML_VULKAN_QUEUE_PRIORITY=0~3, 默认LOW)
+        working-directory: whisper.cpp
+        run: |
+          python3 << 'EOF'
+          path = "ggml/src/ggml-vulkan/ggml-vulkan.cpp"
+          src = open(path).read()
+          orig_len = len(src)
+
+          # ---------- 插入1：全局优先级 fallback 定义（紧跟 internally synchronized defines 之后）----------
+          anchor1 = """static constexpr vk::DeviceQueueCreateFlagBits eInternallySynchronizedKHR = vk::DeviceQueueCreateFlagBits::eInternallySynchronizedKHR;
+          #endif
+          """
+          assert anchor1 in src, "锚点1失败: internally synchronized defines 块"
+          insert1 = anchor1 + """
+          // SM8850 queue-priority patch: fallback defines for VK_KHR_global_priority
+          #ifndef VK_KHR_global_priority
+          #define VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME "VK_KHR_global_priority"
+          #define VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR ((VkStructureType)1000388001)
+          typedef enum VkQueueGlobalPriorityKHR {
+              VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR = 128,
+              VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR = 256,
+              VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR = 512,
+              VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR = 1024,
+          } VkQueueGlobalPriorityKHR;
+          typedef struct VkDeviceQueueGlobalPriorityCreateInfoKHR {
+              VkStructureType             sType;
+              const void*                 pNext;
+              VkQueueGlobalPriorityKHR    globalPriority;
+          } VkDeviceQueueGlobalPriorityCreateInfoKHR;
+          #endif
+          """
+          src = src.replace(anchor1, insert1, 1)
+
+          # ---------- 插入2：扩展检测变量 ----------
+          anchor2 = "        bool internally_sync_support = false;"
+          assert anchor2 in src, "锚点2失败: 检测变量列表"
+          src = src.replace(anchor2, anchor2 + "\n        bool global_priority_support = false;", 1)
+
+          # ---------- 插入3：扩展枚举循环中识别 VK_KHR_global_priority ----------
+          anchor3 = """            } else if (strcmp(VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME, properties.extensionName) == 0) {
+                          internally_sync_support = true;"""
+          assert anchor3 in src, "锚点3失败: 扩展枚举循环"
+          insert3 = anchor3 + """
+                      } else if (strcmp(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME, properties.extensionName) == 0) {
+                          global_priority_support = true;"""
+          src = src.replace(anchor3, insert3, 1)
+
+          # ---------- 插入4：queue create info 之后链入 priority ----------
+          anchor4 = """        } else {
+                      device_queue_create_infos.push_back({queue_flags, compute_queue_family_index, 1, priorities});
+                  }
+          """
+          assert anchor4 in src, "锚点4失败: queue create info 块"
+          insert4 = anchor4 + """
+          // SM8850 queue-priority patch: select queue global priority via env
+          // GGML_VULKAN_QUEUE_PRIORITY: 0=LOW(默认) 1=MEDIUM 2=HIGH 3=REALTIME
+          VkDeviceQueueGlobalPriorityCreateInfoKHR queue_priority_ci{
+              VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR, nullptr,
+              VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR};
+          if (global_priority_support) {
+              const char* qp_env = getenv("GGML_VULKAN_QUEUE_PRIORITY");
+              int qp_level = qp_env ? atoi(qp_env) : 0;
+              static const VkQueueGlobalPriorityKHR qp_map[4] = {
+                  VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR,
+                  VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+                  VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR,
+                  VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR};
+              static const char* qp_names[4] = {"LOW", "MEDIUM", "HIGH", "REALTIME"};
+              if (qp_level < 0 || qp_level > 3) qp_level = 0;
+              queue_priority_ci.globalPriority = qp_map[qp_level];
+              for (auto& qci : device_queue_create_infos) {
+                  qci.pNext = &queue_priority_ci;
+              }
+              device_extensions.push_back(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+              GGML_LOG_INFO("ggml_vulkan: queue global priority: %s\\n", qp_names[qp_level]);
+          } else {
+              GGML_LOG_INFO("ggml_vulkan: VK_KHR_global_priority not supported, using default queue priority\\n");
+          }
+          """
+          src = src.replace(anchor4, insert4, 1)
+
+          # ---------- 插入5：createDevice 加 REALTIME 拒绝回退 ----------
+          anchor5 = "        device->device = device->physical_device.createDevice(device_create_info);"
+          assert anchor5 in src, "锚点5失败: createDevice"
+          insert5 = """        try {
+                  device->device = device->physical_device.createDevice(device_create_info);
+              } catch (const vk::SystemError& e) {
+                  if (global_priority_support && queue_priority_ci.globalPriority != VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR) {
+                      GGML_LOG_WARN("ggml_vulkan: queue priority rejected by driver (%s), retrying MEDIUM\\n", e.what());
+                      queue_priority_ci.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+                      device->device = device->physical_device.createDevice(device_create_info);
+                  } else {
+                      throw;
+                  }
+              }"""
+          src = src.replace(anchor5, insert5, 1)
+
+          assert len(src) > orig_len, "补丁未生效"
+          open(path, "w").write(src)
+          print("=== queue-priority 补丁应用成功 ===")
+          print("验证点1 (fallback defines):", "VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR = 128" in src)
+          print("验证点2 (检测变量):", "global_priority_support = false" in src)
+          print("验证点3 (pNext 链入):", "qci.pNext = &queue_priority_ci" in src)
+          print("验证点4 (MEDIUM 回退):", "retrying MEDIUM" in src)
+          EOF
+
       - name: Setup Android NDK
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip
