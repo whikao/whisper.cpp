@@ -414,6 +414,79 @@ jobs:
           assert s.count(a8) == 1, "split锚点8失败(aheads)"
           s = s.replace(a8, "state->aheads_masks, whisper_backend_dec(state->backends)))")
 
+          # ===== SM8850 split 修复2: encoder 输出跨后端交接改为主存往返 =====
+          # ===== SM8850 split 修复2: encoder 输出跨后端交接改为主存往返 =====
+          # 病根: cross 图输入是 ggml_view_tensor(ctx0, wstate.embd_enc) —— 直接 view 了
+          # GPU buffer 里的 encoder 输出。split 模式下该 buffer 在 Vulkan, cross 算子在 HTP,
+          # 这种跨后端 buffer 视图交接会拿到坏数据 -> 乱码。修法: 全新 cross_in 输入张量,
+          # encode 后 tensor_get 回主存, cross 前 tensor_set 推入(与 mel/tokens 同一标准路径)。
+
+          a9 = "    struct ggml_tensor * embd_enc  = nullptr;"
+          assert s.count(a9) == 1, "split锚点9失败(embd_enc成员)"
+          s = s.replace(a9, a9 + """
+              struct ggml_tensor * cross_in = nullptr;   // SM8850 split: encoder输出主存交接
+              std::vector<uint8_t> cross_in_host;""")
+
+          a10 = "    struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_enc);"
+          assert s.count(a10) == 1, "split锚点10失败(cross输入view)"
+          s = s.replace(a10, """    struct ggml_tensor * cur = nullptr;
+              if (whisper_split_enabled()) {
+                  // SM8850 split: 不把 GPU buffer 的视图交给 HTP 图(跨后端交接会坏)
+                  wstate.cross_in = ggml_new_tensor_2d(ctx0, wstate.embd_enc->type,
+                                                       wstate.embd_enc->ne[0], wstate.embd_enc->ne[1]);
+                  ggml_set_name(wstate.cross_in, "cross_in");
+                  cur = wstate.cross_in;
+              } else {
+                  cur = ggml_view_tensor(ctx0, wstate.embd_enc);
+              }""")
+
+          a11 = """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              // cross"""
+          assert s.count(a11) == 1, "split锚点11失败(encode结束)"
+          s = s.replace(a11, """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+
+              // SM8850 split: encoder 输出拉回主存(后端无关交接)
+              if (whisper_split_enabled() && !whisper_encode_external(wstate)) {
+                  GGML_ASSERT(ggml_is_contiguous(wstate.embd_enc));
+                  const size_t nb = ggml_nbytes(wstate.embd_enc);
+                  wstate.cross_in_host.resize(nb);
+                  ggml_backend_tensor_get(wstate.embd_enc, wstate.cross_in_host.data(), 0, nb);
+              }
+
+              // cross""")
+
+          a12 = """        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
+
+                  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                      // should never happen as we pre-allocate the memory
+                      return false;
+                  }
+
+                  if (!ggml_graph_compute_helper(sched, gf, n_threads)) {"""
+          assert s.count(a12) == 1, "split锚点12失败(cross执行)"
+          s = s.replace(a12, """        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
+
+                  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                      // should never happen as we pre-allocate the memory
+                      return false;
+                  }
+
+
+                  if (whisper_split_enabled()) {
+                      // SM8850 split: 主存 -> cross 输入张量(HTP 侧标准输入路径)
+                      ggml_backend_tensor_set(wstate.cross_in, wstate.cross_in_host.data(), 0, wstate.cross_in_host.size());
+                  }
+
+                  if (!ggml_graph_compute_helper(sched, gf, n_threads)) {""")
+
           open(p, "w").write(s)
           print("OK: split applied")
           print("验证:", "whisper_split_enabled" in s, "make_buft_list_dec" in s,
