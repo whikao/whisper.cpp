@@ -467,7 +467,17 @@ jobs:
                   const size_t nb = ggml_nbytes(wstate.embd_enc);
                   wstate.cross_in_host.resize(nb);
                   ggml_backend_tensor_get(wstate.embd_enc, wstate.cross_in_host.data(), 0, nb);
-                  WHISPER_LOG_INFO("splitdbg: embd_enc host sum=%.1f nbytes=%d\\n", whisper_split_bytesum(wstate.cross_in_host.data(), nb), (int) nb);
+              }
+
+              // SM8850 split 诊断: 无条件打印 encoder 输出校验和(两种模式对比用)
+              if (!whisper_encode_external(wstate)) {
+                  const size_t nb = ggml_nbytes(wstate.embd_enc);
+                  std::vector<uint8_t> dbg(nb);
+                  ggml_backend_tensor_get(wstate.embd_enc, dbg.data(), 0, nb);
+                  WHISPER_LOG_INFO("splitdbg: embd_enc sum=%.1f nbytes=%d ne=[%d,%d,%d,%d]\\n",
+                      whisper_split_bytesum(dbg.data(), nb), (int) nb,
+                      (int) wstate.embd_enc->ne[0], (int) wstate.embd_enc->ne[1],
+                      (int) wstate.embd_enc->ne[2], (int) wstate.embd_enc->ne[3]);
               }
 
               // cross""")
@@ -495,7 +505,8 @@ jobs:
                       {
                           std::vector<uint8_t> chk(wstate.cross_in_host.size());
                           ggml_backend_tensor_get(wstate.cross_in, chk.data(), 0, chk.size());
-                          WHISPER_LOG_INFO("splitdbg: cross_in readback sum=%.1f\\n", whisper_split_bytesum(chk.data(), chk.size()));
+                          WHISPER_LOG_INFO("splitdbg: cross_in readback sum=%.1f host=%d\\n", whisper_split_bytesum(chk.data(), chk.size()),
+                              wstate.cross_in->buffer ? (int) ggml_backend_buffer_is_host(wstate.cross_in->buffer) : -1);
                       }
                   }
 
@@ -531,15 +542,41 @@ jobs:
                       return false;
                   }
 
-                  if (whisper_split_enabled() && wstate.kv_cross.k != nullptr) {
-                      const size_t nbk = ggml_nbytes(wstate.kv_cross.k);
-                      std::vector<uint8_t> chkk(nbk);
-                      ggml_backend_tensor_get(wstate.kv_cross.k, chkk.data(), 0, nbk);
-                      WHISPER_LOG_INFO("splitdbg: kv_cross.k sum=%.1f nbytes=%d\\n", whisper_split_bytesum(chkk.data(), nbk), (int) nbk);
-                  }
+              // SM8850 split 诊断: 无条件打印 kv_cross 校验和(两种模式对比用)
+              if (wstate.kv_cross.k != nullptr) {
+                  const size_t nbk = ggml_nbytes(wstate.kv_cross.k);
+                  std::vector<uint8_t> chkk(nbk);
+                  ggml_backend_tensor_get(wstate.kv_cross.k, chkk.data(), 0, nbk);
+                  const size_t nbv = ggml_nbytes(wstate.kv_cross.v);
+                  std::vector<uint8_t> chkv(nbv);
+                  ggml_backend_tensor_get(wstate.kv_cross.v, chkv.data(), 0, nbv);
+                  WHISPER_LOG_INFO("splitdbg: kv_cross k=%.1f v=%.1f\\n",
+                      whisper_split_bytesum(chkk.data(), nbk), whisper_split_bytesum(chkv.data(), nbv));
+              }
               }
 
               wstate.t_encode_us""")
+
+          # ===== SM8850 split 诊断: decode logits 校验和(前5次) =====
+          a15 = """    logits_out.resize(n_tokens*n_vocab);
+              for (int i = 0; i < n_tokens; i++) {
+                  if (batch.logits[i] == 0) {
+                      continue;
+                  }
+                  ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+              }"""
+          assert s.count(a15) == 1, "split锚点15失败(logits): %d" % s.count(a15)
+          s = s.replace(a15, a15 + """
+
+              {
+                  // SM8850 split 诊断: 前5次 decode 的 logits 校验和
+                  static int dbg_n = 0;
+                  if (dbg_n < 5 && !logits_out.empty()) {
+                      ++dbg_n;
+                      WHISPER_LOG_INFO("splitdbg: logits[%d] sum=%.1f n=%d\\n", dbg_n,
+                          whisper_split_bytesum(logits_out.data(), logits_out.size()*sizeof(float)), (int) logits_out.size());
+                  }
+              }""")
 
           open(p, "w").write(s)
           print("OK: split applied")
