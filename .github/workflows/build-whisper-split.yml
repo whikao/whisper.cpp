@@ -300,7 +300,7 @@ jobs:
                 "qci.pNext = &queue_priority_ci" in src, "retrying MEDIUM" in src)
           EOF
 
-      - name: 打 split 补丁 (WHISPER_SPLIT=1: encoder GPU + decoder NPU)
+      - name: "打 split 补丁 (WHISPER_SPLIT=1, encoder GPU + decoder NPU)"
         run: |
           python3 << 'EOF'
           p = "src/whisper.cpp"
