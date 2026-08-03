@@ -328,8 +328,17 @@ jobs:
               return enabled;
           }
 
+          // SM8850: WHISPER_ALL_NPU=1 复刻 geluxact 全 NPU 拓扑(对照组)
+          static bool whisper_allnpu_enabled() {
+              static const bool enabled = getenv("WHISPER_ALL_NPU") != nullptr;
+              return enabled;
+          }
+          static bool whisper_use_npu() {
+              return whisper_split_enabled() || whisper_allnpu_enabled();
+          }
+
           static ggml_backend_t whisper_backend_dec(const std::vector<ggml_backend_t> & backends) {
-              if (whisper_split_enabled()) {
+              if (whisper_use_npu()) {
                   for (auto b : backends) {
                       if (ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                           WHISPER_LOG_INFO("%s: WHISPER_SPLIT: decoder state -> %s backend\\n", __func__, ggml_backend_name(b));
@@ -355,7 +364,7 @@ jobs:
           // 全 NPU 干净运行时 sched 列表是 [HTP,CPU], 不支持的算子落 CPU(安全)。
           // 修法: decoder/cross 用 [ACCEL,CPU], conv/encode 用 [GPU,CPU], 复刻全 NPU 拓扑。
           static std::vector<ggml_backend_t> whisper_split_sched(const std::vector<ggml_backend_t> & backends, bool want_accel) {
-              if (!whisper_split_enabled()) return backends;
+              if (!whisper_use_npu()) return backends;
               ggml_backend_t pri = nullptr, cpu = nullptr;
               for (auto b : backends) {
                   const auto t = ggml_backend_dev_type(ggml_backend_get_device(b));
@@ -387,7 +396,7 @@ jobs:
           static buft_list_t make_buft_list_dec(whisper_context_params & params) {
               buft_list_t buft_list;
 
-              if (whisper_split_enabled() && params.use_gpu) {
+              if (whisper_use_npu() && params.use_gpu) {
                   for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                       ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                       if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
@@ -429,7 +438,7 @@ jobs:
                   ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta, op, buft_list);"""
           assert s.count(a4) == 1, "split锚点4失败"
           s = s.replace(a4, """        ggml_op op = ASR_TENSOR_INFO.at(type);
-                  const buft_list_t & wlist = (system == ASR_SYSTEM_DECODER || system == ASR_SYSTEM_CROSS) ? buft_list_dec : buft_list;
+                  const buft_list_t & wlist = (whisper_allnpu_enabled() || system == ASR_SYSTEM_DECODER || system == ASR_SYSTEM_CROSS) ? buft_list_dec : buft_list;
                   ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta, op, wlist);""", 1)
 
           a5 = "whisper_kv_cache_init(state->kv_self, state->backends[0],"
@@ -527,7 +536,12 @@ jobs:
 
                   if (whisper_split_enabled()) {
                       // SM8850 split: 主存 -> cross 输入张量(HTP 侧标准输入路径)
+                      if (getenv("WHISPER_SPLIT_NORT")) {
+                          // 修复5候选: 跳过主存往返, Vulkan buffer -> HTP buffer 后端直拷
+                          ggml_backend_tensor_copy(wstate.embd_enc, wstate.cross_in);
+                      } else {
                       ggml_backend_tensor_set(wstate.cross_in, wstate.cross_in_host.data(), 0, wstate.cross_in_host.size());
+                      }
                       {
                           std::vector<uint8_t> chk(wstate.cross_in_host.size());
                           ggml_backend_tensor_get(wstate.cross_in, chk.data(), 0, chk.size());
@@ -553,7 +567,7 @@ jobs:
               bool op_supported = true;
 
               // SM8850 split: ACCEL (Hexagon NPU) 与 GPU 一样收编全部权重, 避免图被切碎
-              if ((whisper_split_enabled() && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) ||
+              if ((whisper_use_npu() && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) ||
                   ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||""")
 
           # ===== SM8850 split 调试: cross 计算后 kv_cross.k 校验和 =====
@@ -607,11 +621,11 @@ jobs:
           # ===== SM8850 split 修复4: 四个 sched 分别用分离的后端列表 =====
           a16 = "whisper_sched_graph_init(state->sched_conv, state->backends,"
           assert s.count(a16) == 1, "split锚点16失败(sched_conv)"
-          s = s.replace(a16, "whisper_sched_graph_init(state->sched_conv, whisper_split_sched(state->backends, false),")
+          s = s.replace(a16, "whisper_sched_graph_init(state->sched_conv, whisper_split_sched(state->backends, whisper_allnpu_enabled()),")
 
           a17 = "whisper_sched_graph_init(state->sched_encode, state->backends,"
           assert s.count(a17) == 1, "split锚点17失败(sched_encode)"
-          s = s.replace(a17, "whisper_sched_graph_init(state->sched_encode, whisper_split_sched(state->backends, false),")
+          s = s.replace(a17, "whisper_sched_graph_init(state->sched_encode, whisper_split_sched(state->backends, whisper_allnpu_enabled()),")
 
           a18 = "whisper_sched_graph_init(state->sched_cross, state->backends,"
           assert s.count(a18) == 1, "split锚点18失败(sched_cross)"
