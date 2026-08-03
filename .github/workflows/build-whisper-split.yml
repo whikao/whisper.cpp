@@ -79,6 +79,13 @@ jobs:
           cp -f /tmp/llama/ggml/include/ggml-hexagon.h ggml/include/ggml-hexagon.h
           grep -n "opt_mm_select = \|opt_fa_select = " ggml/src/ggml-hexagon/ggml-hexagon.cpp || true
           ls ggml/src/ggml-hexagon/htp/ || true
+          # SM8850 split 修复：hexagon 设备类型 GPU -> ACCEL
+          # llama.cpp 把 hexagon 注册为 GPU 类型，whisper 只取第一个 GPU 设备(Vulkan)就 break，
+          # hexagon 永远不会被初始化。改成 ACCEL 后 whisper_backend_init 的 ACCEL 循环会接管它，
+          # WHISPER_SPLIT 的 decoder 后端选择(找 ACCEL)才能命中。
+          sed -i 's/return GGML_BACKEND_DEVICE_TYPE_GPU;/return GGML_BACKEND_DEVICE_TYPE_ACCEL;/' \
+            ggml/src/ggml-hexagon/ggml-hexagon.cpp
+          grep -n "GGML_BACKEND_DEVICE_TYPE_ACCEL" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 打 geluxact 补丁 (DSP skel GELU 精确 erf)
         run: |
