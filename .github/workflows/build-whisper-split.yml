@@ -347,6 +347,32 @@ jobs:
               const uint8_t * q = (const uint8_t *) data;
               for (size_t i = 0; i < nbytes; i += 64) sum += q[i];
               return sum;
+          }
+
+          // SM8850 split 修复4: 调度器后端优先级分离。
+          // 病根: sched 收到全量 backends=[Vulkan,HTP,CPU], HTP 不支持的算子按顺序落到
+          // Vulkan(原生驱动在非常规算子上会算错, 且引入 HTP<->Vulkan 逐算子拷贝 -> sys 暴涨)。
+          // 全 NPU 干净运行时 sched 列表是 [HTP,CPU], 不支持的算子落 CPU(安全)。
+          // 修法: decoder/cross 用 [ACCEL,CPU], conv/encode 用 [GPU,CPU], 复刻全 NPU 拓扑。
+          static std::vector<ggml_backend_t> whisper_split_sched(const std::vector<ggml_backend_t> & backends, bool want_accel) {
+              if (!whisper_split_enabled()) return backends;
+              ggml_backend_t pri = nullptr, cpu = nullptr;
+              for (auto b : backends) {
+                  const auto t = ggml_backend_dev_type(ggml_backend_get_device(b));
+                  if (t == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                      if (want_accel && !pri) pri = b;
+                  } else if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                      if (!want_accel && !pri) pri = b;
+                  } else if (t == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                      if (!cpu) cpu = b;
+                  }
+              }
+              std::vector<ggml_backend_t> out;
+              if (pri) out.push_back(pri);
+              if (cpu) out.push_back(cpu);
+              if (out.empty()) return backends;
+              WHISPER_LOG_INFO("%s: WHISPER_SPLIT: sched list -> %s + CPU\\n", __func__, ggml_backend_name(out[0]));
+              return out;
           }""", 1)
 
           a2 = """    // CPU
@@ -577,6 +603,23 @@ jobs:
                           whisper_split_bytesum(logits_out.data(), logits_out.size()*sizeof(float)), (int) logits_out.size());
                   }
               }""")
+
+          # ===== SM8850 split 修复4: 四个 sched 分别用分离的后端列表 =====
+          a16 = "whisper_sched_graph_init(state->sched_conv, state->backends,"
+          assert s.count(a16) == 1, "split锚点16失败(sched_conv)"
+          s = s.replace(a16, "whisper_sched_graph_init(state->sched_conv, whisper_split_sched(state->backends, false),")
+
+          a17 = "whisper_sched_graph_init(state->sched_encode, state->backends,"
+          assert s.count(a17) == 1, "split锚点17失败(sched_encode)"
+          s = s.replace(a17, "whisper_sched_graph_init(state->sched_encode, whisper_split_sched(state->backends, false),")
+
+          a18 = "whisper_sched_graph_init(state->sched_cross, state->backends,"
+          assert s.count(a18) == 1, "split锚点18失败(sched_cross)"
+          s = s.replace(a18, "whisper_sched_graph_init(state->sched_cross, whisper_split_sched(state->backends, true),")
+
+          a19 = "whisper_sched_graph_init(state->sched_decode, state->backends,"
+          assert s.count(a19) == 1, "split锚点19失败(sched_decode)"
+          s = s.replace(a19, "whisper_sched_graph_init(state->sched_decode, whisper_split_sched(state->backends, true),")
 
           open(p, "w").write(s)
           print("OK: split applied")
