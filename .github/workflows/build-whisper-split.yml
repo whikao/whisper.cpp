@@ -339,6 +339,14 @@ jobs:
                   WHISPER_LOG_WARN("%s: WHISPER_SPLIT set but no ACCEL backend found, using backends[0]\\n", __func__);
               }
               return backends[0];
+          }
+
+          // SM8850 split debug: 后端无关的字节抽样校验和
+          static double whisper_split_bytesum(const void * data, size_t nbytes) {
+              double sum = 0.0;
+              const uint8_t * q = (const uint8_t *) data;
+              for (size_t i = 0; i < nbytes; i += 64) sum += q[i];
+              return sum;
           }""", 1)
 
           a2 = """    // CPU
@@ -459,6 +467,7 @@ jobs:
                   const size_t nb = ggml_nbytes(wstate.embd_enc);
                   wstate.cross_in_host.resize(nb);
                   ggml_backend_tensor_get(wstate.embd_enc, wstate.cross_in_host.data(), 0, nb);
+                  WHISPER_LOG_INFO("splitdbg: embd_enc host sum=%.1f nbytes=%d\\n", whisper_split_bytesum(wstate.cross_in_host.data(), nb), (int) nb);
               }
 
               // cross""")
@@ -483,14 +492,60 @@ jobs:
                   if (whisper_split_enabled()) {
                       // SM8850 split: 主存 -> cross 输入张量(HTP 侧标准输入路径)
                       ggml_backend_tensor_set(wstate.cross_in, wstate.cross_in_host.data(), 0, wstate.cross_in_host.size());
+                      {
+                          std::vector<uint8_t> chk(wstate.cross_in_host.size());
+                          ggml_backend_tensor_get(wstate.cross_in, chk.data(), 0, chk.size());
+                          WHISPER_LOG_INFO("splitdbg: cross_in readback sum=%.1f\\n", whisper_split_bytesum(chk.data(), chk.size()));
+                      }
                   }
 
                   if (!ggml_graph_compute_helper(sched, gf, n_threads)) {""")
 
+          # ===== SM8850 split 修复3: ACCEL 设备收编全部 decoder 权重 =====
+          # 病根2: Hexagon 注册为 ACCEL 后, weight_buft_supported 只放行 MUL_MAT/GET_ROWS,
+          # LayerNorm/bias 等权重落 CPU -> decoder 图被按算子切碎, HTP<->CPU 逐算子往返
+          # (sys 54s 暴涨)且跨后端拷贝链产出坏数据。geluxact 版(GPU 类型, 收编全部权重)干净。
+          # 修法: split 模式下 ACCEL 与 GPU 一样视为"支持全部算子", 完整复刻 geluxact 权重布局。
+
+          a13 = """static bool weight_buft_supported(const whisper_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+              bool op_supported = true;
+
+              if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||"""
+          assert s.count(a13) == 1, "split锚点13失败(weight_buft_supported): %d" % s.count(a13)
+          s = s.replace(a13, """static bool weight_buft_supported(const whisper_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+              bool op_supported = true;
+
+              // SM8850 split: ACCEL (Hexagon NPU) 与 GPU 一样收编全部权重, 避免图被切碎
+              if ((whisper_split_enabled() && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) ||
+                  ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||""")
+
+          # ===== SM8850 split 调试: cross 计算后 kv_cross.k 校验和 =====
+          a14 = """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              wstate.t_encode_us"""
+          assert s.count(a14) == 1, "split锚点14失败(cross后校验): %d" % s.count(a14)
+          s = s.replace(a14, """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+
+                  if (whisper_split_enabled() && wstate.kv_cross.k != nullptr) {
+                      const size_t nbk = ggml_nbytes(wstate.kv_cross.k);
+                      std::vector<uint8_t> chkk(nbk);
+                      ggml_backend_tensor_get(wstate.kv_cross.k, chkk.data(), 0, nbk);
+                      WHISPER_LOG_INFO("splitdbg: kv_cross.k sum=%.1f nbytes=%d\\n", whisper_split_bytesum(chkk.data(), nbk), (int) nbk);
+                  }
+              }
+
+              wstate.t_encode_us""")
+
           open(p, "w").write(s)
           print("OK: split applied")
           print("验证:", "whisper_split_enabled" in s, "make_buft_list_dec" in s,
-                "wlist" in s, s.count("whisper_backend_dec(state->backends)"))
+                "wlist" in s, s.count("whisper_backend_dec(state->backends)"),
+                s.count("whisper_split_bytesum"), s.count("splitdbg:"))
           EOF
 
       - name: 配置 CMake (Vulkan + Hexagon 双后端, v81)
