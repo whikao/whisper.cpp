@@ -37,6 +37,7 @@ on:
           - gelucpu
           - geluff
           - htpcool
+          - spx
         default: 'kernelfix'
         required: true
 
@@ -454,7 +455,7 @@ jobs:
           python3 - << 'EOF'
           mode = "${{ inputs.patch_mode }}"
 
-          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu", "geluff", "htpcool"):
+          if mode in ("q8mm5", "geluenc", "geludump", "vdbg", "nospin", "hybrid", "gelusync", "geluxact", "rxfix", "gelucpu", "geluff", "htpcool", "spx"):
               # 【总根源修复】whisper.cpp 加载模型时直接 fread 进 is_host hexagon
               # buffer（绕过 set_tensor），tiled repack 从未发生 → 量化模型全垃圾。
               # 修复：supported_mul_mat 接受量化权重时就地懒 repack（指针集合记录）。
@@ -863,7 +864,7 @@ jobs:
           grep -n -A 14 "SM8850 gelusync" ggml/src/ggml-hexagon/ggml-hexagon.cpp
 
       - name: 打 geluxact 补丁 (DSP skel GELU 换成精确 erf, 弃用 sigmoid 近似)
-        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu' || inputs.patch_mode == 'htpcool'
+        if: inputs.patch_mode == 'geluxact' || inputs.patch_mode == 'rxfix' || inputs.patch_mode == 'gelucpu' || inputs.patch_mode == 'htpcool' || inputs.patch_mode == 'spx'
         run: |
           python3 << 'EOF'
           upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
@@ -995,6 +996,112 @@ jobs:
           EOF
           echo "=== geluxact 补丁验证 ==="
           grep -n "geluxact\|hvx_gelu_exact_f32_aa\|sigmoid(1.702" ggml/src/ggml-hexagon/htp/unary-ops.c
+
+      - name: "打 spx 对照日志补丁 (geluxact + 仅 checksum 日志, 无 ACCEL/split)"
+        if: inputs.patch_mode == 'spx'
+        run: |
+          python3 << 'EOF'
+          #!/usr/bin/env python3
+          # spx 对照补丁: geluxact + 仅调试 checksum 日志 (无 ACCEL sed / 无 split 机制)
+          p = "src/whisper.cpp"
+          s = open(p).read()
+
+          # 0) bytesum helper: 插在 buft_list_t 定义前
+          a0 = "using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;"
+          assert s.count(a0) == 1, "spx锚点0失败(buft_list_t): %d" % s.count(a0)
+          s = s.replace(a0, """// SM8850 spx: 诊断用抽样校验和(每64字节采1字节)
+          static double whisper_spx_bytesum(const void * data, size_t nbytes) {
+              double sum = 0.0;
+              const uint8_t * q = (const uint8_t *) data;
+              for (size_t i = 0; i < nbytes; i += 64) sum += q[i];
+              return sum;
+          }
+
+          """ + a0)
+
+          # 1) embd_enc 校验和 (encode 计算后)
+          a1 = """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              // cross"""
+          assert s.count(a1) == 1, "spx锚点1失败(encode结束): %d" % s.count(a1)
+          s = s.replace(a1, """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              // SM8850 spx 诊断: 无条件打印 encoder 输出校验和
+              if (!whisper_encode_external(wstate)) {
+                  const size_t nb = ggml_nbytes(wstate.embd_enc);
+                  std::vector<uint8_t> dbg(nb);
+                  ggml_backend_tensor_get(wstate.embd_enc, dbg.data(), 0, nb);
+                  WHISPER_LOG_INFO("spxdbg: embd_enc sum=%.1f nbytes=%d ne=[%d,%d,%d,%d]\\n",
+                      whisper_spx_bytesum(dbg.data(), nb), (int) nb,
+                      (int) wstate.embd_enc->ne[0], (int) wstate.embd_enc->ne[1],
+                      (int) wstate.embd_enc->ne[2], (int) wstate.embd_enc->ne[3]);
+              }
+
+              // cross""")
+
+          # 2) kv_cross 校验和 (cross 计算后)
+          a2 = """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              wstate.t_encode_us += ggml_time_us() - t_start_us;
+              wstate.n_encode++;"""
+          assert s.count(a2) == 1, "spx锚点2失败(cross后): %d" % s.count(a2)
+          s = s.replace(a2, """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              // SM8850 spx 诊断: 无条件打印 kv_cross 校验和
+              if (wstate.kv_cross.k != nullptr) {
+                  const size_t nbk = ggml_nbytes(wstate.kv_cross.k);
+                  std::vector<uint8_t> chkk(nbk);
+                  ggml_backend_tensor_get(wstate.kv_cross.k, chkk.data(), 0, nbk);
+                  const size_t nbv = ggml_nbytes(wstate.kv_cross.v);
+                  std::vector<uint8_t> chkv(nbv);
+                  ggml_backend_tensor_get(wstate.kv_cross.v, chkv.data(), 0, nbv);
+                  WHISPER_LOG_INFO("spxdbg: kv_cross k=%.1f v=%.1f\\n",
+                      whisper_spx_bytesum(chkk.data(), nbk), whisper_spx_bytesum(chkv.data(), nbv));
+              }
+
+              wstate.t_encode_us += ggml_time_us() - t_start_us;
+              wstate.n_encode++;""")
+
+          # 3) logits 校验和 (前5次 decode)
+          a3 = """    logits_out.resize(n_tokens*n_vocab);
+              for (int i = 0; i < n_tokens; i++) {
+                  if (batch.logits[i] == 0) {
+                      continue;
+                  }
+                  ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+              }"""
+          assert s.count(a3) == 1, "spx锚点3失败(logits): %d" % s.count(a3)
+          s = s.replace(a3, a3 + """
+
+              {
+                  // SM8850 spx 诊断: 前5次 decode 的 logits 校验和
+                  static int dbg_n = 0;
+                  if (dbg_n < 5 && !logits_out.empty()) {
+                      ++dbg_n;
+                      WHISPER_LOG_INFO("spxdbg: logits[%d] sum=%.1f n=%d\\n", dbg_n,
+                          whisper_spx_bytesum(logits_out.data(), logits_out.size()*sizeof(float)), (int) logits_out.size());
+                  }
+              }""")
+
+          open(p, "w").write(s)
+          print("OK: spx applied")
+          print("验证:", s.count("whisper_spx_bytesum"), s.count("spxdbg:"))
+
+          EOF
+          echo "=== spx 补丁验证 ==="
+          grep -n "spxdbg" src/whisper.cpp
 
       - name: "打 htpcool 补丁 (降温: GGML_HEXAGON_HTPPERF 六档 DCVS/HMX corner 预设, 默认不加 env 保持满血)"
         if: inputs.patch_mode == 'htpcool'
