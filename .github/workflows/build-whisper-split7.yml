@@ -1,0 +1,647 @@
+name: Build whisper.cpp spx7 (split + llama.cpp版ggml-vulkan覆盖)
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_branch:
+        description: 'whisper.cpp branch'
+        default: 'master'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: r28
+
+jobs:
+  build-split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: 'ggml-org/whisper.cpp'
+          ref: ${{ github.event.inputs.whisper_branch || 'master' }}
+          submodules: recursive
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc cmake ninja-build wget xz-utils
+          glslc --version
+          # SPIRV-Headers（apt 包无 CMake config，源码装）
+          git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers.git
+          cmake -S SPIRV-Headers -B spvh-build -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/spv-install
+          cmake --build spvh-build --target install
+          # Vulkan-Headers（NDK 没有 vulkan.hpp）
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git
+          ls Vulkan-Headers/include/vulkan/vulkan.hpp
+
+      - name: 下载并设置 Android NDK r28
+        run: |
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r28-linux.zip
+          unzip -q android-ndk-r28-linux.zip
+          echo "ANDROID_NDK=/tmp/android-ndk-r28" >> $GITHUB_ENV
+
+      - name: 下载并解压 Hexagon SDK v6.6.0.0
+        run: |
+          cd /tmp
+          wget -q https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v6.6.0.0/hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+          tar -xf hexagon-sdk-v6.6.0.0-amd64-lnx.tar.xz
+          SDK_ROOT=$(find /tmp -maxdepth 3 -type d -name "incs" 2>/dev/null | head -n 1 | xargs dirname)
+          if [ -n "$SDK_ROOT" ]; then
+            echo "HEXAGON_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+            TOOLS_PATH=$(find $SDK_ROOT -path "*/HEXAGON_Tools/19.0.07" 2>/dev/null | head -n 1)
+            if [ -n "$TOOLS_PATH" ]; then
+              echo "HEXAGON_TOOLS_ROOT=$TOOLS_PATH" >> $GITHUB_ENV
+            else
+              echo "❌ 未发现 HEXAGON_Tools/19.0.07"; exit 1
+            fi
+          else
+            echo "❌ 未找到 SDK 目录"; exit 1
+          fi
+
+      - name: 修复官方 SDK 的 CMake 兼容性问题
+        run: |
+          CMAKE_FILE=$(find /tmp -path "*/build/cmake/hexagon_fun.cmake" 2>/dev/null | head -n 1)
+          if [ -n "$CMAKE_FILE" ]; then
+            sed -i '99,106s/^/# /' "$CMAKE_FILE"
+            echo "✅ 已修复: $CMAKE_FILE"
+          fi
+
+      - name: 覆盖最新 ggml-hexagon + ggml-vulkan（llama.cpp 版）
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama
+          rm -rf ggml/src/ggml-hexagon
+          cp -r /tmp/llama/ggml/src/ggml-hexagon ggml/src/
+          cp -f /tmp/llama/ggml/include/ggml-hexagon.h ggml/include/ggml-hexagon.h
+          # SM8850 spx7: whisper 自带 ggml-vulkan 在 Adreno 原生驱动上点不亮矩阵核
+          # ("No suitable matrix core mode found"), encoder matmul 只有 ~160 GFLOPS。
+          # 覆盖 llama.cpp 主线 ggml-vulkan(含 Adreno coopmat 持续修复)。
+          rm -rf ggml/src/ggml-vulkan
+          cp -r /tmp/llama/ggml/src/ggml-vulkan ggml/src/
+          cp -f /tmp/llama/ggml/include/ggml-vulkan.h ggml/include/ggml-vulkan.h 2>/dev/null || true
+          echo "=== llama.cpp ggml-vulkan HEAD ==="
+          git -C /tmp/llama log -1 --format='%h %ad %s' --date=short -- ggml/src/ggml-vulkan || true
+          grep -n "opt_mm_select = \|opt_fa_select = " ggml/src/ggml-hexagon/ggml-hexagon.cpp || true
+          ls ggml/src/ggml-hexagon/htp/ || true
+          # SM8850 split 修复：hexagon 设备类型 GPU -> ACCEL
+          # llama.cpp 把 hexagon 注册为 GPU 类型，whisper 只取第一个 GPU 设备(Vulkan)就 break，
+          # hexagon 永远不会被初始化。改成 ACCEL 后 whisper_backend_init 的 ACCEL 循环会接管它，
+          # WHISPER_SPLIT 的 decoder 后端选择(找 ACCEL)才能命中。
+          sed -i 's/return GGML_BACKEND_DEVICE_TYPE_GPU;/return GGML_BACKEND_DEVICE_TYPE_ACCEL;/' \
+            ggml/src/ggml-hexagon/ggml-hexagon.cpp
+          grep -n "GGML_BACKEND_DEVICE_TYPE_ACCEL" ggml/src/ggml-hexagon/ggml-hexagon.cpp
+
+      - name: 打 geluxact 补丁 (DSP skel GELU 精确 erf)
+        run: |
+          python3 << 'EOF'
+          upath = "ggml/src/ggml-hexagon/htp/unary-ops.c"
+          usrc = open(upath).read()
+
+          helper = r'''
+          // SM8850 geluxact: exact erf GELU (matches ggml GELU reference), not sigmoid approx.
+          // erf(z) via Abramowitz & Stegun 7.1.26 (|eps| <= 1.5e-7):
+          #define HVX_GX_MUL(a, b)    Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), Q6_V_vzero()))
+          #define HVX_GX_FMA(a, b, c) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(a, b), c))
+
+          static inline HVX_Vector hvx_vec_gelu_exact_f32(HVX_Vector x) {
+              const HVX_Vector half   = hvx_vec_splat_f32(0.5f);
+              const HVX_Vector one    = hvx_vec_splat_f32(1.0f);
+              const HVX_Vector zero   = hvx_vec_splat_f32(0.0f);
+              const HVX_Vector invsq2 = hvx_vec_splat_f32(0.70710678f);
+              const HVX_Vector cp     = hvx_vec_splat_f32(0.3275911f);
+              const HVX_Vector a1     = hvx_vec_splat_f32(0.254829592f);
+              const HVX_Vector a2     = hvx_vec_splat_f32(-0.284496736f);
+              const HVX_Vector a3     = hvx_vec_splat_f32(1.421413741f);
+              const HVX_Vector a4     = hvx_vec_splat_f32(-1.453152027f);
+              const HVX_Vector a5     = hvx_vec_splat_f32(1.061405429f);
+
+              const HVX_Vector z  = HVX_GX_MUL(x, invsq2);
+              const HVX_Vector az = hvx_vec_abs_f32(z);
+
+              const HVX_Vector t = hvx_vec_inverse_f32(HVX_GX_FMA(cp, az, one));
+
+              HVX_Vector poly = HVX_GX_FMA(t, a5, a4);
+              poly = HVX_GX_FMA(t, poly, a3);
+              poly = HVX_GX_FMA(t, poly, a2);
+              poly = HVX_GX_FMA(t, poly, a1);
+              poly = HVX_GX_MUL(t, poly);
+
+              const HVX_Vector zz = HVX_GX_MUL(z, z);
+              const HVX_Vector e  = hvx_vec_exp_f32(hvx_vec_neg_f32(zz));
+
+              const HVX_Vector erf_abs = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(one, HVX_GX_MUL(poly, e)));
+
+              const HVX_VectorPred neg = Q6_Q_vcmp_gt_VsfVsf(zero, z);
+              const HVX_Vector erf_v   = Q6_V_vmux_QVV(neg, hvx_vec_neg_f32(erf_abs), erf_abs);
+
+              const HVX_Vector r = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(one, erf_v));
+              return HVX_GX_MUL(x, HVX_GX_MUL(half, r));
+          }
+
+          #define hvx_gelu_exact_loop_body(dst_type, src_type, vec_store) \
+              do {                                                        \
+                  dst_type * restrict vdst = (dst_type *) dst;            \
+                  src_type * restrict vsrc = (src_type *) src;            \
+                                                                          \
+                  const uint32_t epv  = 128 / sizeof(float);              \
+                  const uint32_t nvec = n / epv;                          \
+                  const uint32_t nloe = n % epv;                          \
+                                                                          \
+                  uint32_t i = 0;                                         \
+                  _Pragma("unroll(4)")                                    \
+                  for (; i < nvec; i++) {                                 \
+                       vdst[i] = hvx_vec_gelu_exact_f32(vsrc[i]);         \
+                  }                                                       \
+                  if (nloe) {                                             \
+                       HVX_Vector tmp = hvx_vec_gelu_exact_f32(vsrc[i]);  \
+                       vec_store((void *) &vdst[i], nloe * sizeof(float), tmp); \
+                  }                                                       \
+              } while(0)
+
+          static inline void hvx_gelu_exact_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
+              hvx_gelu_exact_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
+          }
+          '''
+
+          g1_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_mul_scalar_f32(dst_local, src_local, 1.702f, ne0);
+                  hvx_sigmoid_f32_aa(dst_local, dst_local, ne0);
+                  hvx_mul_f32_aaa(dst_local, src_local, dst_local, ne0);
+              }
+          }'''
+          g1_new = helper + '''
+          // gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (exact erf, matches CPU GELU reference)
+          static void gelu_f32(const float * restrict src,
+                               float * restrict dst,
+                               const uint32_t num_rows,
+                               const struct htp_unary_context * uctx) {
+              htp_unary_op_preamble;
+
+              for (uint32_t ir = 0; ir < num_rows; ir++) {
+                  const uint8_t * restrict src_local = (const uint8_t *)src + (ir * src0_row_size_aligned);
+                  uint8_t * restrict dst_local       = (uint8_t *)dst + (ir * dst_row_size_aligned);
+
+                  hvx_gelu_exact_f32_aa(dst_local, src_local, ne0);
+              }
+          }'''
+          assert usrc.count(g1_old) == 1, "geluxact anchor-1 不唯一"
+          usrc = usrc.replace(g1_old, g1_new)
+
+          g2_old = '''// gelu(x) = x * sigmoid(1.702 * x)  (quick/sigmoid approximation, matches CPU GELU_QUICK reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_mul_scalar_f32(dst_vtcm, src_vtcm, 1.702f, tw);
+              hvx_sigmoid_f32_aa(dst_vtcm, dst_vtcm, tw);
+              hvx_mul_f32_aaa(dst_vtcm, src_vtcm, dst_vtcm, tw);
+          }'''
+          g2_new = '''// gelu(x) = x * 0.5 * (1 + erf(x/sqrt(2)))  (exact erf, matches CPU GELU reference)
+          static inline void tile_gelu_f32(uint8_t * dst_vtcm, const uint8_t * src_vtcm, uint32_t tw) {
+              hvx_gelu_exact_f32_aa(dst_vtcm, src_vtcm, tw);
+          }'''
+          assert usrc.count(g2_old) == 1, "geluxact anchor-2 不唯一"
+          usrc = usrc.replace(g2_old, g2_new)
+
+          open(upath, "w").write(usrc)
+          print("OK: geluxact applied")
+          EOF
+
+      - name: "打 split 补丁 (WHISPER_SPLIT=1, encoder GPU + decoder NPU)"
+        run: |
+          python3 << 'EOF'
+          p = "src/whisper.cpp"
+          s = open(p).read()
+
+          a1 = """    result.push_back(backend_cpu);
+
+              return result;
+          }"""
+          assert s.count(a1) == 1, "split锚点1失败"
+          s = s.replace(a1, a1 + """
+
+          // ================== SM8850 split patch (encoder GPU + decoder NPU) ==================
+          // WHISPER_SPLIT=1: decoder/cross weights and KV caches -> ACCEL (Hexagon NPU),
+          // encoder stays on GPU (Vulkan). ggml_backend_sched auto-inserts cross-device copies.
+          static bool whisper_split_enabled() {
+              static const bool enabled = getenv("WHISPER_SPLIT") != nullptr;
+              return enabled;
+          }
+
+          // SM8850: WHISPER_ALL_NPU=1 复刻 geluxact 全 NPU 拓扑(对照组)
+          static bool whisper_allnpu_enabled() {
+              static const bool enabled = getenv("WHISPER_ALL_NPU") != nullptr;
+              return enabled;
+          }
+          static bool whisper_use_npu() {
+              return whisper_split_enabled() || whisper_allnpu_enabled();
+          }
+
+          static ggml_backend_t whisper_backend_dec(const std::vector<ggml_backend_t> & backends) {
+              if (whisper_use_npu()) {
+                  for (auto b : backends) {
+                      if (ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                          WHISPER_LOG_INFO("%s: WHISPER_SPLIT: decoder state -> %s backend\\n", __func__, ggml_backend_name(b));
+                          return b;
+                      }
+                  }
+                  WHISPER_LOG_WARN("%s: WHISPER_SPLIT set but no ACCEL backend found, using backends[0]\\n", __func__);
+              }
+              return backends[0];
+          }
+
+          // SM8850 split debug: 后端无关的字节抽样校验和
+          static double whisper_split_bytesum(const void * data, size_t nbytes) {
+              double sum = 0.0;
+              const uint8_t * q = (const uint8_t *) data;
+              for (size_t i = 0; i < nbytes; i += 64) sum += q[i];
+              return sum;
+          }
+
+          // SM8850 split 修复4: 调度器后端优先级分离。
+          // 病根: sched 收到全量 backends=[Vulkan,HTP,CPU], HTP 不支持的算子按顺序落到
+          // Vulkan(原生驱动在非常规算子上会算错, 且引入 HTP<->Vulkan 逐算子拷贝 -> sys 暴涨)。
+          // 全 NPU 干净运行时 sched 列表是 [HTP,CPU], 不支持的算子落 CPU(安全)。
+          // 修法: decoder/cross 用 [ACCEL,CPU], conv/encode 用 [GPU,CPU], 复刻全 NPU 拓扑。
+          static std::vector<ggml_backend_t> whisper_split_sched(const std::vector<ggml_backend_t> & backends, bool want_accel) {
+              if (!whisper_use_npu()) return backends;
+              ggml_backend_t pri = nullptr, cpu = nullptr;
+              for (auto b : backends) {
+                  const auto t = ggml_backend_dev_type(ggml_backend_get_device(b));
+                  if (t == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                      if (want_accel && !pri) pri = b;
+                  } else if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                      if (!want_accel && !pri) pri = b;
+                  } else if (t == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                      if (!cpu) cpu = b;
+                  }
+              }
+              std::vector<ggml_backend_t> out;
+              if (pri) out.push_back(pri);
+              if (cpu) out.push_back(cpu);
+              if (out.empty()) return backends;
+              WHISPER_LOG_INFO("%s: WHISPER_SPLIT: sched list -> %s + CPU\\n", __func__, ggml_backend_name(out[0]));
+              return out;
+          }""", 1)
+
+          a2 = """    // CPU
+              buft_list.emplace_back(cpu_dev, ggml_backend_cpu_buffer_type());
+
+              return buft_list;
+          }"""
+          assert s.count(a2) == 1, "split锚点2失败"
+          s = s.replace(a2, a2 + """
+
+          // SM8850 split patch: decoder-side weight buft priority: ACCEL (NPU) -> CPU extra -> CPU
+          static buft_list_t make_buft_list_dec(whisper_context_params & params) {
+              buft_list_t buft_list;
+
+              if (whisper_use_npu() && params.use_gpu) {
+                  for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                      ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                      if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                          auto * buft = ggml_backend_dev_buffer_type(dev);
+                          if (buft) {
+                              buft_list.emplace_back(dev, buft);
+                          }
+                      }
+                  }
+                  if (!buft_list.empty()) {
+                      WHISPER_LOG_INFO("%s: WHISPER_SPLIT: decoder weights prefer ACCEL (NPU)\\n", __func__);
+                  }
+              }
+
+              // CPU Extra
+              auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+              auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+              auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+                  ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+              if (get_extra_bufts_fn) {
+                  ggml_backend_buffer_type_t * extra_bufts = get_extra_bufts_fn(cpu_dev);
+                  while (extra_bufts && *extra_bufts) {
+                      buft_list.emplace_back(cpu_dev, *extra_bufts);
+                      ++extra_bufts;
+                  }
+              }
+
+              // CPU
+              buft_list.emplace_back(cpu_dev, ggml_backend_cpu_buffer_type());
+
+              return buft_list;
+          }""", 1)
+
+          a3 = "    buft_list_t buft_list = make_buft_list(wctx.params);"
+          assert s.count(a3) == 1, "split锚点3失败"
+          s = s.replace(a3, a3 + "\n    buft_list_t buft_list_dec = make_buft_list_dec(wctx.params);", 1)
+
+          a4 = """        ggml_op op = ASR_TENSOR_INFO.at(type);
+                  ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta, op, buft_list);"""
+          assert s.count(a4) == 1, "split锚点4失败"
+          s = s.replace(a4, """        ggml_op op = ASR_TENSOR_INFO.at(type);
+                  const buft_list_t & wlist = (whisper_allnpu_enabled() || system == ASR_SYSTEM_DECODER || system == ASR_SYSTEM_CROSS) ? buft_list_dec : buft_list;
+                  ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta, op, wlist);""", 1)
+
+          a5 = "whisper_kv_cache_init(state->kv_self, state->backends[0],"
+          assert s.count(a5) == 2, "split锚点5失败(kv_self): %d" % s.count(a5)
+          s = s.replace(a5, "whisper_kv_cache_init(state->kv_self, whisper_backend_dec(state->backends),")
+
+          a6 = "whisper_kv_cache_init(state->kv_cross, state->backends[0],"
+          assert s.count(a6) == 1, "split锚点6失败(kv_cross)"
+          s = s.replace(a6, "whisper_kv_cache_init(state->kv_cross, whisper_backend_dec(state->backends),")
+
+          a7 = "whisper_kv_cache_init(state->kv_pad, state->backends[0],"
+          assert s.count(a7) == 1, "split锚点7失败(kv_pad)"
+          s = s.replace(a7, "whisper_kv_cache_init(state->kv_pad, whisper_backend_dec(state->backends),")
+
+          a8 = "state->aheads_masks, state->backends[0]))"
+          assert s.count(a8) == 1, "split锚点8失败(aheads)"
+          s = s.replace(a8, "state->aheads_masks, whisper_backend_dec(state->backends)))")
+
+          # ===== SM8850 split 修复2: encoder 输出跨后端交接改为主存往返 =====
+          # ===== SM8850 split 修复2: encoder 输出跨后端交接改为主存往返 =====
+          # 病根: cross 图输入是 ggml_view_tensor(ctx0, wstate.embd_enc) —— 直接 view 了
+          # GPU buffer 里的 encoder 输出。split 模式下该 buffer 在 Vulkan, cross 算子在 HTP,
+          # 这种跨后端 buffer 视图交接会拿到坏数据 -> 乱码。修法: 全新 cross_in 输入张量,
+          # encode 后 tensor_get 回主存, cross 前 tensor_set 推入(与 mel/tokens 同一标准路径)。
+
+          a9 = "    struct ggml_tensor * embd_enc  = nullptr;"
+          assert s.count(a9) == 1, "split锚点9失败(embd_enc成员)"
+          s = s.replace(a9, a9 + """
+              struct ggml_tensor * cross_in = nullptr;   // SM8850 split: encoder输出主存交接
+              std::vector<uint8_t> cross_in_host;""")
+
+          a10 = "    struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_enc);"
+          assert s.count(a10) == 1, "split锚点10失败(cross输入view)"
+          s = s.replace(a10, """    struct ggml_tensor * cur = nullptr;
+              if (whisper_split_enabled()) {
+                  // SM8850 split: 不把 GPU buffer 的视图交给 HTP 图(跨后端交接会坏)
+                  wstate.cross_in = ggml_new_tensor_2d(ctx0, wstate.embd_enc->type,
+                                                       wstate.embd_enc->ne[0], wstate.embd_enc->ne[1]);
+                  ggml_set_name(wstate.cross_in, "cross_in");
+                  cur = wstate.cross_in;
+              } else {
+                  cur = ggml_view_tensor(ctx0, wstate.embd_enc);
+              }""")
+
+          a11 = """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              // cross"""
+          assert s.count(a11) == 1, "split锚点11失败(encode结束)"
+          s = s.replace(a11, """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+
+              // SM8850 split: encoder 输出拉回主存(后端无关交接)
+              if (whisper_split_enabled() && !whisper_encode_external(wstate)) {
+                  GGML_ASSERT(ggml_is_contiguous(wstate.embd_enc));
+                  const size_t nb = ggml_nbytes(wstate.embd_enc);
+                  wstate.cross_in_host.resize(nb);
+                  ggml_backend_tensor_get(wstate.embd_enc, wstate.cross_in_host.data(), 0, nb);
+              }
+
+              // SM8850 split 诊断: 无条件打印 encoder 输出校验和(两种模式对比用)
+              if (!whisper_encode_external(wstate)) {
+                  const size_t nb = ggml_nbytes(wstate.embd_enc);
+                  std::vector<uint8_t> dbg(nb);
+                  ggml_backend_tensor_get(wstate.embd_enc, dbg.data(), 0, nb);
+                  WHISPER_LOG_INFO("splitdbg: embd_enc sum=%.1f nbytes=%d ne=[%d,%d,%d,%d]\\n",
+                      whisper_split_bytesum(dbg.data(), nb), (int) nb,
+                      (int) wstate.embd_enc->ne[0], (int) wstate.embd_enc->ne[1],
+                      (int) wstate.embd_enc->ne[2], (int) wstate.embd_enc->ne[3]);
+              }
+
+              // cross""")
+
+          a12 = """        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
+
+                  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                      // should never happen as we pre-allocate the memory
+                      return false;
+                  }
+
+                  if (!ggml_graph_compute_helper(sched, gf, n_threads)) {"""
+          assert s.count(a12) == 1, "split锚点12失败(cross执行)"
+          s = s.replace(a12, """        ggml_cgraph * gf = whisper_build_graph_cross(wctx, wstate);
+
+                  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                      // should never happen as we pre-allocate the memory
+                      return false;
+                  }
+
+
+                  if (whisper_split_enabled()) {
+                      // SM8850 split: 主存 -> cross 输入张量(HTP 侧标准输入路径)
+                      if (getenv("WHISPER_SPLIT_NORT")) {
+                          // 修复5候选: 跳过主存往返, Vulkan buffer -> HTP buffer 后端直拷
+                          ggml_backend_tensor_copy(wstate.embd_enc, wstate.cross_in);
+                      } else {
+                      ggml_backend_tensor_set(wstate.cross_in, wstate.cross_in_host.data(), 0, wstate.cross_in_host.size());
+                      }
+                      {
+                          std::vector<uint8_t> chk(wstate.cross_in_host.size());
+                          ggml_backend_tensor_get(wstate.cross_in, chk.data(), 0, chk.size());
+                          WHISPER_LOG_INFO("splitdbg: cross_in readback sum=%.1f host=%d\\n", whisper_split_bytesum(chk.data(), chk.size()),
+                              wstate.cross_in->buffer ? (int) ggml_backend_buffer_is_host(wstate.cross_in->buffer) : -1);
+                      }
+                  }
+
+                  if (!ggml_graph_compute_helper(sched, gf, n_threads)) {""")
+
+          # ===== SM8850 split 修复3: ACCEL 设备收编全部 decoder 权重 =====
+          # 病根2: Hexagon 注册为 ACCEL 后, weight_buft_supported 只放行 MUL_MAT/GET_ROWS,
+          # LayerNorm/bias 等权重落 CPU -> decoder 图被按算子切碎, HTP<->CPU 逐算子往返
+          # (sys 54s 暴涨)且跨后端拷贝链产出坏数据。geluxact 版(GPU 类型, 收编全部权重)干净。
+          # 修法: split 模式下 ACCEL 与 GPU 一样视为"支持全部算子", 完整复刻 geluxact 权重布局。
+
+          a13 = """static bool weight_buft_supported(const whisper_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+              bool op_supported = true;
+
+              if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||"""
+          assert s.count(a13) == 1, "split锚点13失败(weight_buft_supported): %d" % s.count(a13)
+          s = s.replace(a13, """static bool weight_buft_supported(const whisper_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
+              bool op_supported = true;
+
+              // SM8850 split: ACCEL (Hexagon NPU) 与 GPU 一样收编全部权重, 避免图被切碎
+              if ((whisper_use_npu() && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) ||
+                  ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||""")
+
+          # ===== SM8850 split 调试: cross 计算后 kv_cross.k 校验和 =====
+          a14 = """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+              }
+
+              wstate.t_encode_us"""
+          assert s.count(a14) == 1, "split锚点14失败(cross后校验): %d" % s.count(a14)
+          s = s.replace(a14, """        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
+                      return false;
+                  }
+
+              // SM8850 split 诊断: 无条件打印 kv_cross 校验和(两种模式对比用)
+              if (wstate.kv_cross.k != nullptr) {
+                  const size_t nbk = ggml_nbytes(wstate.kv_cross.k);
+                  std::vector<uint8_t> chkk(nbk);
+                  ggml_backend_tensor_get(wstate.kv_cross.k, chkk.data(), 0, nbk);
+                  const size_t nbv = ggml_nbytes(wstate.kv_cross.v);
+                  std::vector<uint8_t> chkv(nbv);
+                  ggml_backend_tensor_get(wstate.kv_cross.v, chkv.data(), 0, nbv);
+                  WHISPER_LOG_INFO("splitdbg: kv_cross k=%.1f v=%.1f\\n",
+                      whisper_split_bytesum(chkk.data(), nbk), whisper_split_bytesum(chkv.data(), nbv));
+              }
+              }
+
+              wstate.t_encode_us""")
+
+          # ===== SM8850 split 诊断: decode logits 校验和(前5次) =====
+          a15 = """    logits_out.resize(n_tokens*n_vocab);
+              for (int i = 0; i < n_tokens; i++) {
+                  if (batch.logits[i] == 0) {
+                      continue;
+                  }
+                  ggml_backend_tensor_get(logits, logits_out.data() + (n_vocab*i), sizeof(float)*(n_vocab*i), sizeof(float)*n_vocab);
+              }"""
+          assert s.count(a15) == 1, "split锚点15失败(logits): %d" % s.count(a15)
+          s = s.replace(a15, a15 + """
+
+              {
+                  // SM8850 split 诊断: 前5次 decode 的 logits 校验和
+                  static int dbg_n = 0;
+                  if (dbg_n < 5 && !logits_out.empty()) {
+                      ++dbg_n;
+                      WHISPER_LOG_INFO("splitdbg: logits[%d] sum=%.1f n=%d\\n", dbg_n,
+                          whisper_split_bytesum(logits_out.data(), logits_out.size()*sizeof(float)), (int) logits_out.size());
+                  }
+              }""")
+
+          # ===== SM8850 split 修复4: 四个 sched 分别用分离的后端列表 =====
+          a16 = "whisper_sched_graph_init(state->sched_conv, state->backends,"
+          assert s.count(a16) == 1, "split锚点16失败(sched_conv)"
+          s = s.replace(a16, "whisper_sched_graph_init(state->sched_conv, whisper_split_sched(state->backends, whisper_allnpu_enabled()),")
+
+          a17 = "whisper_sched_graph_init(state->sched_encode, state->backends,"
+          assert s.count(a17) == 1, "split锚点17失败(sched_encode)"
+          s = s.replace(a17, "whisper_sched_graph_init(state->sched_encode, whisper_split_sched(state->backends, whisper_allnpu_enabled()),")
+
+          a18 = "whisper_sched_graph_init(state->sched_cross, state->backends,"
+          assert s.count(a18) == 1, "split锚点18失败(sched_cross)"
+          s = s.replace(a18, "whisper_sched_graph_init(state->sched_cross, whisper_split_sched(state->backends, true),")
+
+          a19 = "whisper_sched_graph_init(state->sched_decode, state->backends,"
+          assert s.count(a19) == 1, "split锚点19失败(sched_decode)"
+          s = s.replace(a19, "whisper_sched_graph_init(state->sched_decode, whisper_split_sched(state->backends, true),")
+
+          open(p, "w").write(s)
+          print("OK: split applied")
+          print("验证:", "whisper_split_enabled" in s, "make_buft_list_dec" in s,
+                "wlist" in s, s.count("whisper_backend_dec(state->backends)"),
+                s.count("whisper_split_bytesum"), s.count("splitdbg:"))
+          EOF
+
+      - name: "打 spx4 补丁 (WHISPER_NO_VK_INIT: 跳过 Vulkan backend 初始化)"
+        run: |
+          python3 << 'EOF'
+          p = "src/whisper.cpp"
+          s = open(p).read()
+          a = """static ggml_backend_t whisper_backend_init_gpu(const whisper_context_params & params) {
+              ggml_log_set(g_state.log_callback, g_state.log_callback_user_data);"""
+          assert s.count(a) == 1, "spx4锚点失败(init_gpu): %d" % s.count(a)
+          s = s.replace(a, a + """
+
+              // SM8850 spx4: 跳过 GPU backend 初始化(验证 Vulkan init 踩 CDSP 内存假设)
+              if (getenv("WHISPER_NO_VK_INIT")) {
+                  WHISPER_LOG_INFO("%s: WHISPER_NO_VK_INIT: skipping GPU backend init\\n", __func__);
+                  return nullptr;
+              }""")
+          open(p, "w").write(s)
+          print("OK: spx4 novk applied")
+          EOF
+          grep -n "WHISPER_NO_VK_INIT" src/whisper.cpp | head -3
+
+      - name: 配置 CMake (Vulkan + Hexagon 双后端, v81)
+        run: |
+          SYSROOT=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          VK_INC=$GITHUB_WORKSPACE/Vulkan-Headers/include
+          SPV_INC=$GITHUB_WORKSPACE/spv-install/include
+          VK_LIB=$(find $SYSROOT/usr/lib/aarch64-linux-android -name "libvulkan.so" | sort -V | tail -1)
+          echo "Vulkan lib: $VK_LIB"
+
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=latest \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_HEXAGON=ON \
+            -DHEXAGON_SDK_ROOT=${{ env.HEXAGON_SDK_ROOT }} \
+            -DHEXAGON_TOOLS_ROOT=${{ env.HEXAGON_TOOLS_ROOT }} \
+            -DHTP_ARCH_VERSION=v81 \
+            -DGGML_VULKAN=ON \
+            -DGGML_CPU_ARM_ARCH=armv9.2-a+i8mm+sme2 \
+            -DCMAKE_CXX_FLAGS="-I$VK_INC -I$SPV_INC" \
+            -DVulkan_LIBRARY=$VK_LIB \
+            -DVulkan_INCLUDE_DIR=$VK_INC \
+            -DSPIRV-Headers_DIR=$GITHUB_WORKSPACE/spv-install/share/cmake/SPIRV-Headers \
+            -DBUILD_SHARED_LIBS=ON \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=OFF
+
+      - name: 编译
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: 打包产物
+        run: |
+          mkdir -p pkg
+          find build/bin -type f -executable -exec cp {} pkg/ \; 2>/dev/null || true
+          find build -name "libggml*.so" -exec cp {} pkg/ \;
+          find build -name "libwhisper*.so" -exec cp {} pkg/ \;
+          find build -path "*ggml-hexagon*" -name "libggml-htp*.so" -exec cp {} pkg/ \;
+          cd pkg && zip -r ../whisper-split-vulkan-hexagon.zip . && cd ..
+          ls -la pkg/
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-split-vulkan-hexagon-arm64
+          path: whisper-split-vulkan-hexagon.zip
+          if-no-files-found: error
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: split-build-${{ github.run_number }}
+          name: Whisper Split (Vulkan+Hexagon) Build #${{ github.run_number }}
+          body: |
+            SM8850 双后端合体构建：encoder -> Vulkan(GPU), decoder -> Hexagon(NPU)
+            补丁: geluxact + split (spx3: 无 queue 补丁)
+
+            ## Termux 使用
+            ```bash
+            export LD_LIBRARY_PATH=.:/vendor/lib64
+            WHISPER_SPLIT=1 ./whisper-cli -m ggml-large-v3-turbo-q8_0.bin -f audio.wav \
+              -l en -t 3 -bs 1 -bo 1 -ml 42 --max-context 64
+            # 本构建无 queue 补丁（原生 Vulkan 队列优先级）
+            # 不开 WHISPER_SPLIT 时行为与原版一致
+            ```
+            注意：整套 .so 一起换新，不要与旧版混用
+          files: whisper-split-vulkan-hexagon.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
